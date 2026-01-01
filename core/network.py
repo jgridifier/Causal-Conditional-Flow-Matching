@@ -236,8 +236,10 @@ def create_causal_mask(
 
     # Create mask: M[i,j] = 1 if order[j] <= order[i] (j can influence i)
     # This allows upstream variables to influence downstream
-    order_i = order.unsqueeze(0).expand(dim, -1)  # (dim, dim)
-    order_j = order.unsqueeze(1).expand(-1, dim)  # (dim, dim)
+    # order_i[i,j] = order[i] (the order of output i, same across all columns)
+    # order_j[i,j] = order[j] (the order of input j, same across all rows)
+    order_i = order.unsqueeze(1).expand(-1, dim)  # (dim, dim) - rows
+    order_j = order.unsqueeze(0).expand(dim, -1)  # (dim, dim) - columns
 
     if include_diagonal:
         mask = (order_j <= order_i).float()

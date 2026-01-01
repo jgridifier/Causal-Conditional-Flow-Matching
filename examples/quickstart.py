@@ -114,11 +114,13 @@ def main():
     print(f"    Mean of VIX variable: {stressed[:, vix_idx].mean():.4f}")
 
     # Multiple shocks
+    # Use the processed variable names from the topology
     print("\n  Generating multi-shock scenario...")
+    var_names = cfm.variable_names
     multi = cfm.multi_shock(
         shocks={
-            fast_vars[0]: 2.0,   # First fast variable +2 std
-            fast_vars[1]: -1.5   # Second fast variable -1.5 std
+            var_names[0]: 2.0,   # First variable +2 std
+            var_names[1]: -1.5   # Second variable -1.5 std
         },
         n_samples=100,
         regime=0

@@ -577,7 +577,8 @@ class DataProcessor:
         if len(fast_indices) < 2:
             # Not enough fast variables for causal discovery
             # Order: slow first, then fast
-            return np.concatenate([slow_indices, fast_indices])
+            result = np.concatenate([slow_indices, fast_indices])
+            return result.astype(int) if len(result) > 0 else np.arange(n_features, dtype=int)
 
         # Extract fast block for LiNGAM
         fast_block = X[:, fast_indices]

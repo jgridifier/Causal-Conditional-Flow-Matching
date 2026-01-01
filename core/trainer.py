@@ -165,11 +165,15 @@ class FlowMatchingTrainer:
         train_dataset = TensorDataset(X[train_idx], regimes[train_idx])
         val_dataset = TensorDataset(X[val_idx], regimes[val_idx])
 
+        # Only drop last batch if we'd still have at least one batch
+        # This avoids zero batches when batch_size > dataset_size
+        effective_drop_last = len(train_idx) > self.config.batch_size
+
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            drop_last=True
+            drop_last=effective_drop_last
         )
         self.val_loader = DataLoader(
             val_dataset,
@@ -329,6 +333,14 @@ class FlowMatchingTrainer:
             total_fast_error += metrics['fast_error']
             n_batches += 1
 
+        # Guard against zero batches (batch_size > dataset_size)
+        if n_batches == 0:
+            return {
+                'val_loss': float('nan'),
+                'val_slow_error': float('nan'),
+                'val_fast_error': float('nan'),
+            }
+
         return {
             'val_loss': total_loss / n_batches,
             'val_slow_error': total_slow_error / n_batches,
@@ -456,6 +468,13 @@ class FlowMatchingTrainer:
             total_loss += metrics['loss']
             total_grad_norm += metrics['grad_norm']
             n_batches += 1
+
+        # Guard against zero batches (batch_size > dataset_size)
+        if n_batches == 0:
+            return {
+                'loss': float('nan'),
+                'grad_norm': float('nan'),
+            }
 
         return {
             'loss': total_loss / n_batches,
