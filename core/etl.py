@@ -13,14 +13,15 @@ Critical Notes:
 - ODE solvers are extremely sensitive to NaN/Inf - validation is mandatory
 - StandardScaler is required for stable gradients in the OT-Path
 - The causal_permutation_list must be saved with the model artifacts
+
+Note: This module uses Polars for DataFrame operations (not pandas).
 """
 
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from scipy import interpolate
-from scipy.stats import zscore
 from statsmodels.tsa.stattools import adfuller
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
@@ -82,6 +83,33 @@ class DataTopology:
         }
 
 
+def _to_numpy_array(data: Union[np.ndarray, pl.DataFrame, "pd.DataFrame"]) -> Tuple[np.ndarray, List[str]]:
+    """Convert input data to numpy array with column names.
+
+    Supports numpy arrays, Polars DataFrames, and pandas DataFrames (for compatibility).
+
+    Args:
+        data: Input data in various formats
+
+    Returns:
+        X: Numpy array of shape (n_samples, n_features)
+        column_names: List of column names
+    """
+    if isinstance(data, np.ndarray):
+        return data.astype(np.float64), [f"var_{i}" for i in range(data.shape[1])]
+    elif isinstance(data, pl.DataFrame):
+        return data.to_numpy().astype(np.float64), data.columns
+    else:
+        # Fallback for pandas DataFrame (for backward compatibility)
+        try:
+            return data.values.astype(np.float64), list(data.columns)
+        except AttributeError:
+            raise TypeError(
+                f"Unsupported data type: {type(data)}. "
+                "Expected numpy.ndarray, polars.DataFrame, or pandas.DataFrame"
+            )
+
+
 class DataProcessor:
     """Complete data preprocessing pipeline for C-CFM.
 
@@ -128,7 +156,7 @@ class DataProcessor:
 
     def fit_transform(
         self,
-        X: Union[np.ndarray, pd.DataFrame],
+        X: Union[np.ndarray, pl.DataFrame],
         fast_vars: Optional[List[str]] = None,
         slow_vars: Optional[List[str]] = None,
         regime_response_vars: Optional[List[str]] = None
@@ -137,7 +165,7 @@ class DataProcessor:
 
         Args:
             X: Raw time series data of shape (T, D)
-               - If DataFrame, column names are used for variable identification
+               - If Polars DataFrame, column names are used for variable identification
                - If ndarray, provide fast_vars and slow_vars as indices
             fast_vars: Names/indices of "fast" market variables
                        (e.g., VIX, daily returns, spreads)
@@ -149,13 +177,8 @@ class DataProcessor:
         Returns:
             DataTopology containing all processed data and metadata
         """
-        # Convert to DataFrame for consistent handling
-        if isinstance(X, np.ndarray):
-            X_df = pd.DataFrame(X, columns=[f"var_{i}" for i in range(X.shape[1])])
-        else:
-            X_df = X.copy()
-
-        variable_names = list(X_df.columns)
+        # Convert to numpy array with column names
+        X_array, variable_names = _to_numpy_array(X)
         n_vars = len(variable_names)
 
         # Parse fast/slow variable specifications
@@ -164,7 +187,7 @@ class DataProcessor:
         )
 
         # Step A: Validation and Cleaning
-        X_clean, differenced_cols = self._validate_and_clean(X_df)
+        X_clean, differenced_cols = self._validate_and_clean(X_array)
 
         # Step B: Dimensionality Reduction (if needed)
         X_reduced, pca_info = self._apply_dimensionality_reduction(
@@ -268,7 +291,7 @@ class DataProcessor:
 
     def _validate_and_clean(
         self,
-        X_df: pd.DataFrame
+        X: np.ndarray
     ) -> Tuple[np.ndarray, List[int]]:
         """Validate data, impute NaNs, and enforce stationarity.
 
@@ -278,7 +301,7 @@ class DataProcessor:
             X_clean: Clean numpy array with no missing values
             differenced_cols: List of columns that were differenced
         """
-        X = X_df.values.astype(np.float64)
+        X = X.astype(np.float64)
         n_samples, n_features = X.shape
         differenced_cols = []
 
@@ -603,7 +626,7 @@ class DataProcessor:
 
     def transform(
         self,
-        X: Union[np.ndarray, pd.DataFrame],
+        X: Union[np.ndarray, pl.DataFrame],
         topology: DataTopology
     ) -> np.ndarray:
         """Transform new data using fitted preprocessing.
@@ -615,27 +638,26 @@ class DataProcessor:
         Returns:
             X_processed: Transformed and ordered data
         """
-        if isinstance(X, pd.DataFrame):
-            X = X.values
-
-        X = X.astype(np.float64)
+        # Convert to numpy array
+        X_array, _ = _to_numpy_array(X)
+        X_array = X_array.astype(np.float64)
 
         # Apply differencing to same columns
         for col in topology.differenced_cols:
-            if col < X.shape[1]:
-                X[:, col] = self._apply_differencing(X[:, col], 1)
+            if col < X_array.shape[1]:
+                X_array[:, col] = self._apply_differencing(X_array[:, col], 1)
 
         # Remove NaN rows from differencing
-        valid_mask = ~np.any(np.isnan(X), axis=1)
-        X = X[valid_mask]
+        valid_mask = ~np.any(np.isnan(X_array), axis=1)
+        X_array = X_array[valid_mask]
 
         # Normalize using stored statistics
-        X = (X - topology.scaler_mean) / topology.scaler_std
+        X_array = (X_array - topology.scaler_mean) / topology.scaler_std
 
         # Reorder according to causal order
-        X = X[:, topology.causal_order]
+        X_array = X_array[:, topology.causal_order]
 
-        return X
+        return X_array
 
     def denormalize(
         self,
@@ -690,3 +712,36 @@ def validate_for_ode(X: np.ndarray) -> None:
             f"Data contains extreme values (max abs: {max_val:.2e}). "
             "Consider normalization for numerical stability."
         )
+
+
+def numpy_to_polars(X: np.ndarray, column_names: Optional[List[str]] = None) -> pl.DataFrame:
+    """Convert numpy array to Polars DataFrame.
+
+    Helper function for users who want to work with Polars DataFrames.
+
+    Args:
+        X: Numpy array of shape (n_samples, n_features)
+        column_names: Optional list of column names
+
+    Returns:
+        df: Polars DataFrame
+    """
+    if column_names is None:
+        column_names = [f"var_{i}" for i in range(X.shape[1])]
+
+    return pl.DataFrame(
+        {name: X[:, i] for i, name in enumerate(column_names)}
+    )
+
+
+def polars_to_numpy(df: pl.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    """Convert Polars DataFrame to numpy array with column names.
+
+    Args:
+        df: Polars DataFrame
+
+    Returns:
+        X: Numpy array
+        columns: List of column names
+    """
+    return df.to_numpy().astype(np.float64), df.columns
