@@ -6,15 +6,19 @@ with causal structure enforcement for economic scenario generation.
 
 Core Components:
     - CTree: Conditional inference tree for regime classification
-    - DataProcessor: ETL pipeline with causal graph discovery
+    - DataProcessor: ETL pipeline with causal graph discovery (CAM/LiNGAM)
     - VelocityNetwork: Masked neural network with FiLM conditioning
     - FlowMatchingTrainer: Simulation-free CFM training
     - ODESolver: Adaptive ODE integration with stress testing
 
+Causal Discovery Methods:
+    - CAM (default): Causal Additive Models for non-linear relationships
+    - LiNGAM: Linear Non-Gaussian Acyclic Model for linear systems
+
 Quick Start:
     >>> from core import CausalFlowMatcher
     >>>
-    >>> # Initialize with data
+    >>> # Initialize with data (CAM is default)
     >>> cfm = CausalFlowMatcher()
     >>> cfm.fit(X, fast_vars=['VIX', 'SPX_ret'], slow_vars=['GDP', 'CPI'])
     >>>
@@ -24,9 +28,13 @@ Quick Start:
     >>> # Stress test
     >>> stressed = cfm.shock('VIX', magnitude=3.0)
 
+    >>> # For linear systems, use LiNGAM:
+    >>> cfm.fit(X, fast_vars=['A', 'B'], causal_discovery_method='lingam')
+
 References:
     - Lipman et al. (2022): Flow Matching for Generative Modeling
     - Hothorn et al. (2006): Unbiased Recursive Partitioning
+    - Bühlmann et al. (2014): CAM - Causal Additive Models
     - Shimizu et al. (2006): LiNGAM - Linear Non-Gaussian Acyclic Model
 """
 
@@ -196,7 +204,8 @@ class CausalFlowMatcher:
         regime_response_vars: Optional[List[str]] = None,
         adf_threshold: float = 0.05,
         ctree_alpha: float = 0.05,
-        ctree_min_split: int = 20
+        ctree_min_split: int = 20,
+        causal_discovery_method: str = 'cam'
     ) -> "CausalFlowMatcher":
         """Fit the preprocessing pipeline and initialize the model.
 
@@ -204,7 +213,7 @@ class CausalFlowMatcher:
         1. Data validation and cleaning (NaN imputation)
         2. Stationarity enforcement (ADF test + differencing)
         3. Regime classification (CTree-Lite)
-        4. Causal graph discovery (LiNGAM on fast block)
+        4. Causal graph discovery (CAM or LiNGAM on fast block)
         5. Model initialization with causal masking
 
         Args:
@@ -215,6 +224,10 @@ class CausalFlowMatcher:
             adf_threshold: P-value threshold for stationarity test
             ctree_alpha: Significance threshold for regime splits
             ctree_min_split: Minimum samples per regime
+            causal_discovery_method: Method for causal discovery ('cam' or 'lingam').
+                Default is 'cam' (Causal Additive Models) which handles non-linear
+                financial relationships (convexity, thresholds). Use 'lingam' for
+                linear systems testing.
 
         Returns:
             self: Fitted instance
@@ -223,7 +236,8 @@ class CausalFlowMatcher:
         self.processor = DataProcessor(
             adf_threshold=adf_threshold,
             ctree_alpha=ctree_alpha,
-            ctree_min_split=ctree_min_split
+            ctree_min_split=ctree_min_split,
+            causal_discovery_method=causal_discovery_method
         )
 
         # Process data
@@ -244,6 +258,7 @@ class CausalFlowMatcher:
         print(f"  Samples: {len(self.topology.X_processed)}")
         print(f"  Fast variables: {len(self.topology.fast_indices)}")
         print(f"  Slow variables: {len(self.topology.slow_indices)}")
+        print(f"  Causal discovery: {causal_discovery_method.upper()}")
 
         # Initialize model
         self.model = VelocityNetwork(

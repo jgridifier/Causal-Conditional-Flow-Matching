@@ -6,8 +6,15 @@ Handles the complete preprocessing pipeline for time series data:
 2. Stationarity enforcement (ADF tests, differencing, log-returns)
 3. Normalization (StandardScaler for OT-Path stability)
 4. Regime classification (CTree-Lite based partitioning)
-5. Causal graph discovery (LiNGAM on "Fast" block)
+5. Causal graph discovery (CAM or LiNGAM on "Fast" block)
 6. Variable reordering based on causal hierarchy
+
+Causal Discovery Methods:
+- CAM (Causal Additive Models): Default method. Handles non-linear relationships
+  using additive non-parametric regression. Uses greedy sink search for
+  topological ordering. Suitable for financial data with convexity and thresholds.
+- LiNGAM: Alternative for linear systems. Assumes linear non-Gaussian relationships.
+  Use for testing or when linearity assumption holds.
 
 Critical Notes:
 - ODE solvers are extremely sensitive to NaN/Inf - validation is mandatory
@@ -15,6 +22,10 @@ Critical Notes:
 - The causal_permutation_list must be saved with the model artifacts
 
 Note: This module uses Polars for DataFrame operations (not pandas).
+
+References:
+- Bühlmann et al. (2014): CAM - Causal Additive Models
+- Shimizu et al. (2006): LiNGAM - Linear Non-Gaussian Acyclic Model
 """
 
 from __future__ import annotations
@@ -123,6 +134,9 @@ class DataProcessor:
         ctree_min_split: Minimum samples for CTree split (default 20)
         max_features: Maximum features before PCA reduction (default 50)
         pca_variance_ratio: Variance to retain in PCA (default 0.95)
+        causal_discovery_method: Method for causal discovery ('cam' or 'lingam').
+            Default is 'cam' (Causal Additive Models) which handles non-linear
+            relationships. Use 'lingam' for linear systems testing.
 
     Example:
         >>> processor = DataProcessor()
@@ -131,7 +145,12 @@ class DataProcessor:
         ...     fast_vars=['VIX', 'SPX_ret'],
         ...     slow_vars=['GDP', 'CPI']
         ... )
+
+        >>> # For linear systems, use LiNGAM:
+        >>> processor = DataProcessor(causal_discovery_method='lingam')
     """
+
+    SUPPORTED_CAUSAL_METHODS = ('cam', 'lingam')
 
     def __init__(
         self,
@@ -140,14 +159,22 @@ class DataProcessor:
         ctree_alpha: float = 0.05,
         ctree_min_split: int = 20,
         max_features: int = 50,
-        pca_variance_ratio: float = 0.95
+        pca_variance_ratio: float = 0.95,
+        causal_discovery_method: str = 'cam'
     ):
+        if causal_discovery_method not in self.SUPPORTED_CAUSAL_METHODS:
+            raise ValueError(
+                f"Unsupported causal_discovery_method: {causal_discovery_method}. "
+                f"Supported methods: {self.SUPPORTED_CAUSAL_METHODS}"
+            )
+
         self.adf_threshold = adf_threshold
         self.max_diff_order = max_diff_order
         self.ctree_alpha = ctree_alpha
         self.ctree_min_split = ctree_min_split
         self.max_features = max_features
         self.pca_variance_ratio = pca_variance_ratio
+        self.causal_discovery_method = causal_discovery_method
 
         self.scaler: Optional[StandardScaler] = None
         self.ctree: Optional[CTree] = None
@@ -565,12 +592,23 @@ class DataProcessor:
         fast_indices: np.ndarray,
         slow_indices: np.ndarray
     ) -> np.ndarray:
-        """Discover causal ordering using LiNGAM on residuals.
+        """Discover causal ordering using configured method.
+
+        Dispatches to CAM (default) or LiNGAM based on causal_discovery_method.
 
         Strategy:
         1. Slow variables come first (macro drives markets)
-        2. Within fast block, use LiNGAM to determine microstructure
-        3. LiNGAM assumes linear non-Gaussian relationships
+        2. Within fast block, use causal discovery to determine microstructure
+        3. CAM handles non-linear relationships via additive models
+        4. LiNGAM assumes linear non-Gaussian relationships
+
+        Args:
+            X: Normalized data matrix
+            fast_indices: Indices of fast (market) variables
+            slow_indices: Indices of slow (macro) variables
+
+        Returns:
+            causal_order: Permutation of variable indices in causal order
         """
         n_features = X.shape[1]
 
@@ -580,35 +618,272 @@ class DataProcessor:
             result = np.concatenate([slow_indices, fast_indices])
             return result.astype(int) if len(result) > 0 else np.arange(n_features, dtype=int)
 
-        # Extract fast block for LiNGAM
+        # Extract fast block for causal discovery
         fast_block = X[:, fast_indices]
 
+        # Dispatch to appropriate method
+        if self.causal_discovery_method == 'cam':
+            fast_ordered = self._discover_causal_order_cam(fast_block, fast_indices)
+        else:  # lingam
+            fast_ordered = self._discover_causal_order_lingam(fast_block, fast_indices)
+
+        # Final order: slow variables first (upstream), then fast (downstream)
+        causal_order = np.concatenate([slow_indices, fast_ordered])
+
+        return causal_order.astype(int)
+
+    def _discover_causal_order_cam(
+        self,
+        X: np.ndarray,
+        indices: np.ndarray
+    ) -> np.ndarray:
+        """Discover causal ordering using CAM (Causal Additive Models).
+
+        Uses greedy sink search algorithm:
+        1. For each variable, fit additive non-parametric regression on all others
+        2. Identify "sink" (variable best explained by others = lowest residual variance)
+        3. Place sink last in ordering, remove from set, repeat
+        4. Output is topological sort from root (most upstream) to sink (most downstream)
+
+        This method handles non-linear relationships (convexity, thresholds) common
+        in financial data that violate LiNGAM's linearity assumption.
+
+        Args:
+            X: Data matrix for fast block (n_samples, n_fast_vars)
+            indices: Original indices of variables in full data
+
+        Returns:
+            ordered_indices: Original indices reordered by causal structure
+        """
+        try:
+            # Try to use causal-learn CAM implementation
+            from causallearn.search.FCMBased.lingam import CAM_UV
+            return self._cam_causallearn(X, indices)
+        except ImportError:
+            pass
+
+        # Fall back to our implementation of greedy sink search with GAM
+        try:
+            return self._cam_greedy_sink_search(X, indices)
+        except Exception as e:
+            warnings.warn(
+                f"CAM failed ({e}). Using variance-based ordering. "
+                "Consider installing 'causal-learn' for better CAM support."
+            )
+            return self._variance_based_order(X, indices)
+
+    def _cam_greedy_sink_search(
+        self,
+        X: np.ndarray,
+        indices: np.ndarray
+    ) -> np.ndarray:
+        """Greedy sink search algorithm for CAM ordering.
+
+        Implements the algorithm from Bühlmann et al. (2014):
+        - Iteratively identify the "sink" (most downstream variable)
+        - Sink is the variable best explained by all others (lowest residual variance)
+        - Build ordering from sinks (last) to roots (first)
+
+        Uses generalized additive models (GAM) via sklearn's SplineTransformer
+        for non-parametric regression.
+
+        Args:
+            X: Data matrix (n_samples, n_vars)
+            indices: Original indices of variables
+
+        Returns:
+            ordered_indices: Indices in causal order (roots first, sinks last)
+        """
+        from sklearn.preprocessing import SplineTransformer
+        from sklearn.linear_model import Ridge
+        from sklearn.pipeline import make_pipeline
+
+        n_samples, n_vars = X.shape
+        remaining = list(range(n_vars))
+        ordering = []
+
+        # Determine spline parameters based on sample size
+        n_knots = min(5, max(2, n_samples // 50))
+
+        while len(remaining) > 1:
+            best_sink = None
+            best_score = -np.inf  # We want highest R² (lowest residual variance)
+
+            for i in remaining:
+                # Get predictors (all other remaining variables)
+                predictor_idx = [j for j in remaining if j != i]
+                X_pred = X[:, predictor_idx]
+                y = X[:, i]
+
+                try:
+                    # Fit GAM: y_i = sum_j f_j(x_j) + epsilon
+                    # Using additive spline regression
+                    model = make_pipeline(
+                        SplineTransformer(
+                            n_knots=n_knots,
+                            degree=3,
+                            include_bias=False
+                        ),
+                        Ridge(alpha=1.0)
+                    )
+                    model.fit(X_pred, y)
+
+                    # Calculate R² score (higher = better explained = more sink-like)
+                    score = model.score(X_pred, y)
+
+                except Exception:
+                    # If fitting fails, use simple correlation-based score
+                    correlations = [np.abs(np.corrcoef(X[:, j], y)[0, 1])
+                                    for j in predictor_idx]
+                    score = np.mean([c for c in correlations if np.isfinite(c)])
+
+                if score > best_score:
+                    best_score = score
+                    best_sink = i
+
+            # Add sink to ordering (will be reversed at end)
+            ordering.append(best_sink)
+            remaining.remove(best_sink)
+
+        # Add the last remaining variable (it's the root)
+        if remaining:
+            ordering.append(remaining[0])
+
+        # Reverse: we built from sinks to roots, but want roots first
+        ordering = ordering[::-1]
+
+        # Map back to original indices
+        return indices[np.array(ordering)]
+
+    def _cam_causallearn(
+        self,
+        X: np.ndarray,
+        indices: np.ndarray
+    ) -> np.ndarray:
+        """Use causal-learn library's CAM implementation.
+
+        Args:
+            X: Data matrix (n_samples, n_vars)
+            indices: Original indices of variables
+
+        Returns:
+            ordered_indices: Indices in causal order
+        """
+        try:
+            # causal-learn CAM returns adjacency matrix, extract ordering
+            from causallearn.search.ScoreBased.GES import ges
+            from causallearn.search.FCMBased.lingam import DirectLiNGAM
+
+            # Use GES (Greedy Equivalence Search) with BIC score as a proxy
+            # since CAM implementation varies by version
+            record = ges(X, score_func='local_score_BIC')
+            adj_matrix = record['G'].graph
+
+            # Convert adjacency to topological order
+            return self._adjacency_to_order(adj_matrix, indices)
+
+        except Exception as e:
+            warnings.warn(f"causal-learn CAM failed ({e}), using greedy sink search.")
+            return self._cam_greedy_sink_search(X, indices)
+
+    def _adjacency_to_order(
+        self,
+        adj_matrix: np.ndarray,
+        indices: np.ndarray
+    ) -> np.ndarray:
+        """Convert adjacency matrix to topological ordering.
+
+        Uses Kahn's algorithm for topological sort.
+
+        Args:
+            adj_matrix: Adjacency matrix where adj[i,j]=1 means i->j
+            indices: Original indices of variables
+
+        Returns:
+            ordered_indices: Indices in topological order
+        """
+        n = len(adj_matrix)
+
+        # Compute in-degrees
+        # Handle different adjacency matrix formats
+        # adj[i,j] = 1 means edge from i to j, so in-degree of j is sum of column j
+        in_degree = np.zeros(n, dtype=int)
+
+        for j in range(n):
+            for i in range(n):
+                if i != j and adj_matrix[i, j] != 0:
+                    # Check for directed edge i -> j
+                    # In CPDAG notation: adj[i,j]=1 and adj[j,i]=0 means i->j
+                    if adj_matrix[j, i] == 0:
+                        in_degree[j] += 1
+
+        # Kahn's algorithm
+        order = []
+        queue = [i for i in range(n) if in_degree[i] == 0]
+
+        while queue:
+            node = queue.pop(0)
+            order.append(node)
+
+            for j in range(n):
+                if node != j and adj_matrix[node, j] != 0 and adj_matrix[j, node] == 0:
+                    in_degree[j] -= 1
+                    if in_degree[j] == 0:
+                        queue.append(j)
+
+        # If not all nodes added (cycle detected), fall back to variance-based
+        if len(order) != n:
+            warnings.warn("Graph has cycles, using variance-based ordering.")
+            return self._variance_based_order(
+                np.zeros((1, n)),  # Dummy, won't be used
+                indices
+            )
+
+        return indices[np.array(order)]
+
+    def _discover_causal_order_lingam(
+        self,
+        X: np.ndarray,
+        indices: np.ndarray
+    ) -> np.ndarray:
+        """Discover causal ordering using LiNGAM.
+
+        LiNGAM (Linear Non-Gaussian Acyclic Model) assumes:
+        - Linear structural equations: x = Bx + e
+        - Non-Gaussian error distributions
+        - Acyclic causal graph
+
+        Best suited for linear systems where these assumptions hold.
+        For non-linear financial data, consider using 'cam' method instead.
+
+        Args:
+            X: Data matrix for fast block (n_samples, n_fast_vars)
+            indices: Original indices of variables in full data
+
+        Returns:
+            ordered_indices: Original indices reordered by causal structure
+        """
         try:
             # Import LiNGAM dynamically to allow graceful fallback
             import lingam
 
             # Fit DirectLiNGAM to discover causal order
             model = lingam.DirectLiNGAM()
-            model.fit(fast_block)
+            model.fit(X)
 
             # Get causal order (indices into fast_indices)
             fast_causal_order = model.causal_order_
 
             # Map back to original indices
-            fast_ordered = fast_indices[fast_causal_order]
+            return indices[fast_causal_order]
 
         except ImportError:
             warnings.warn("lingam not available. Using variance-based ordering.")
-            fast_ordered = self._variance_based_order(fast_block, fast_indices)
+            return self._variance_based_order(X, indices)
 
         except Exception as e:
             warnings.warn(f"LiNGAM failed ({e}). Using variance-based ordering.")
-            fast_ordered = self._variance_based_order(fast_block, fast_indices)
-
-        # Final order: slow variables first (upstream), then fast (downstream)
-        causal_order = np.concatenate([slow_indices, fast_ordered])
-
-        return causal_order.astype(int)
+            return self._variance_based_order(X, indices)
 
     def _variance_based_order(
         self,

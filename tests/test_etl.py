@@ -394,6 +394,157 @@ class TestCausalOrdering:
         assert ordered[0] == 0  # Lowest variance first
 
 
+class TestCAMCausalDiscovery:
+    """Test CAM (Causal Additive Models) causal discovery."""
+
+    def test_cam_is_default_method(self):
+        """Test that CAM is the default causal discovery method."""
+        processor = DataProcessor()
+        assert processor.causal_discovery_method == 'cam'
+
+    def test_cam_slow_before_fast_ordering(self):
+        """Test that CAM orders slow variables before fast."""
+        np.random.seed(42)
+
+        X = np.random.randn(100, 4)
+        fast_indices = np.array([0, 1])
+        slow_indices = np.array([2, 3])
+
+        processor = DataProcessor(causal_discovery_method='cam')
+        causal_order = processor._discover_causal_order(X, fast_indices, slow_indices)
+
+        # Slow should come first
+        slow_positions = [np.where(causal_order == i)[0][0] for i in slow_indices]
+        fast_positions = [np.where(causal_order == i)[0][0] for i in fast_indices]
+
+        assert max(slow_positions) < min(fast_positions)
+
+    def test_cam_greedy_sink_search(self):
+        """Test CAM greedy sink search produces valid ordering."""
+        np.random.seed(42)
+
+        # Create data with causal structure: X0 -> X1 -> X2
+        n_samples = 200
+        X0 = np.random.randn(n_samples)
+        X1 = 0.8 * X0 + 0.2 * np.random.randn(n_samples)
+        X2 = 0.6 * X1 + 0.3 * np.random.randn(n_samples)
+        X = np.column_stack([X0, X1, X2])
+
+        indices = np.array([0, 1, 2])
+
+        processor = DataProcessor(causal_discovery_method='cam')
+        ordered = processor._cam_greedy_sink_search(X, indices)
+
+        # Check that ordering is a valid permutation
+        assert len(ordered) == 3
+        assert set(ordered) == {0, 1, 2}
+
+    def test_cam_greedy_sink_with_nonlinear_data(self):
+        """Test CAM handles non-linear relationships."""
+        np.random.seed(42)
+
+        # Create non-linear causal structure: X0 -> X1 (quadratic), X1 -> X2
+        n_samples = 300
+        X0 = np.random.randn(n_samples)
+        X1 = 0.5 * X0**2 + 0.3 * np.random.randn(n_samples)  # Non-linear
+        X2 = np.sin(X1) + 0.2 * np.random.randn(n_samples)   # Non-linear
+        X = np.column_stack([X0, X1, X2])
+
+        indices = np.array([0, 1, 2])
+
+        processor = DataProcessor(causal_discovery_method='cam')
+        ordered = processor._cam_greedy_sink_search(X, indices)
+
+        # Should produce valid ordering
+        assert len(ordered) == 3
+        assert set(ordered) == {0, 1, 2}
+
+    def test_cam_with_full_pipeline(self):
+        """Test CAM with full fit_transform pipeline."""
+        np.random.seed(42)
+
+        X = np.random.randn(100, 6)
+
+        processor = DataProcessor(
+            ctree_alpha=0.20,
+            ctree_min_split=20,
+            causal_discovery_method='cam'
+        )
+
+        topology = processor.fit_transform(
+            X,
+            fast_vars=[0, 1, 2],
+            slow_vars=[3, 4, 5]
+        )
+
+        assert topology.X_processed.shape[0] <= 100
+        assert topology.X_processed.shape[1] == 6
+        assert len(topology.causal_order) == 6
+
+
+class TestLiNGAMCausalDiscovery:
+    """Test LiNGAM causal discovery (explicit selection)."""
+
+    def test_lingam_method_selection(self):
+        """Test that LiNGAM can be explicitly selected."""
+        processor = DataProcessor(causal_discovery_method='lingam')
+        assert processor.causal_discovery_method == 'lingam'
+
+    def test_lingam_slow_before_fast_ordering(self):
+        """Test that LiNGAM orders slow variables before fast."""
+        np.random.seed(42)
+
+        X = np.random.randn(100, 4)
+        fast_indices = np.array([0, 1])
+        slow_indices = np.array([2, 3])
+
+        processor = DataProcessor(causal_discovery_method='lingam')
+        causal_order = processor._discover_causal_order(X, fast_indices, slow_indices)
+
+        # Slow should come first
+        slow_positions = [np.where(causal_order == i)[0][0] for i in slow_indices]
+        fast_positions = [np.where(causal_order == i)[0][0] for i in fast_indices]
+
+        assert max(slow_positions) < min(fast_positions)
+
+    def test_lingam_with_full_pipeline(self):
+        """Test LiNGAM with full fit_transform pipeline."""
+        np.random.seed(42)
+
+        # Use Student-t data for non-Gaussian (LiNGAM requirement)
+        from scipy.stats import t as student_t
+        X = student_t.rvs(df=5, size=(100, 6))
+
+        processor = DataProcessor(
+            ctree_alpha=0.20,
+            ctree_min_split=20,
+            causal_discovery_method='lingam'
+        )
+
+        topology = processor.fit_transform(
+            X,
+            fast_vars=[0, 1, 2],
+            slow_vars=[3, 4, 5]
+        )
+
+        assert topology.X_processed.shape[0] <= 100
+        assert topology.X_processed.shape[1] == 6
+
+
+class TestCausalMethodValidation:
+    """Test validation of causal discovery method parameter."""
+
+    def test_invalid_method_raises_error(self):
+        """Test that invalid method raises ValueError."""
+        with pytest.raises(ValueError, match="Unsupported causal_discovery_method"):
+            DataProcessor(causal_discovery_method='invalid_method')
+
+    def test_supported_methods(self):
+        """Test that supported methods are correctly defined."""
+        assert 'cam' in DataProcessor.SUPPORTED_CAUSAL_METHODS
+        assert 'lingam' in DataProcessor.SUPPORTED_CAUSAL_METHODS
+
+
 class TestDataTopology:
     """Test DataTopology dataclass."""
 
