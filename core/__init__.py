@@ -11,6 +11,12 @@ Core Components:
     - FlowMatchingTrainer: Simulation-free CFM training
     - ODESolver: Adaptive ODE integration with stress testing
 
+Terminology (aligned with paper Section 3-4):
+    - FAST (informationally fast) = UPSTREAM = drives other variables = FIRST
+      Example: Interest rates, Fed policy decisions
+    - SLOW (informationally slow) = DOWNSTREAM = reacts to all = SINK = LAST
+      Example: S&P 500 returns, VIX (reacts to everything)
+
 Causal Discovery Methods:
     - CAM (default): Causal Additive Models for non-linear relationships
     - LiNGAM: Linear Non-Gaussian Acyclic Model for linear systems
@@ -18,18 +24,19 @@ Causal Discovery Methods:
 Quick Start:
     >>> from core import CausalFlowMatcher
     >>>
-    >>> # Initialize with data (CAM is default)
+    >>> # Automatic causal discovery on all variables
     >>> cfm = CausalFlowMatcher()
-    >>> cfm.fit(X, fast_vars=['VIX', 'SPX_ret'], slow_vars=['GDP', 'CPI'])
+    >>> cfm.fit(X)
+    >>>
+    >>> # With optional ordering hints (Bayesian prior)
+    >>> cfm.fit(X, causal_order_hint=['Rates', 'Spreads', 'Equities'])
+    >>> # This ensures: Rates (fast/upstream) before Spreads before Equities (slow/sink)
     >>>
     >>> # Generate scenarios
     >>> scenarios = cfm.sample(n_samples=1000)
     >>>
     >>> # Stress test
-    >>> stressed = cfm.shock('VIX', magnitude=3.0)
-
-    >>> # For linear systems, use LiNGAM:
-    >>> cfm.fit(X, fast_vars=['A', 'B'], causal_discovery_method='lingam')
+    >>> stressed = cfm.shock('Equities', magnitude=-3.0)
 
 References:
     - Lipman et al. (2022): Flow Matching for Generative Modeling
@@ -74,7 +81,7 @@ from .solver import (
 )
 
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "C-CFM Team"
 
 
@@ -123,11 +130,15 @@ class CausalFlowMatcher:
     This class provides a unified interface for the complete C-CFM pipeline:
     data preprocessing, model training, and scenario generation.
 
+    Terminology (aligned with paper Section 3-4):
+    - FAST = informationally fast = UPSTREAM = drives other variables = FIRST
+    - SLOW = informationally slow = DOWNSTREAM = reacts to all = SINK = LAST
+
     The workflow enforces causal structure in generated scenarios:
-    1. "Slow" macro variables (GDP, CPI) are upstream
-    2. "Fast" market variables (VIX, returns) are downstream
-    3. Shocks to fast variables propagate to slow (and to other fast)
-    4. Shocks to slow variables only affect themselves
+    1. FAST (upstream) variables like interest rates are placed FIRST
+    2. SLOW (downstream/sink) variables like S&P 500 are placed LAST
+    3. The causal mask ensures upstream variables can influence downstream
+    4. Downstream variables cannot instantaneously influence upstream
 
     Attributes:
         processor: Data preprocessing pipeline
@@ -145,12 +156,11 @@ class CausalFlowMatcher:
     Example:
         >>> cfm = CausalFlowMatcher(hidden_dim=256)
         >>>
-        >>> # Fit to data
-        >>> cfm.fit(
-        ...     X,
-        ...     fast_vars=['VIX', 'SPX_ret', 'Credit_Spread'],
-        ...     slow_vars=['GDP_Growth', 'CPI', 'Unemployment']
-        ... )
+        >>> # Automatic causal discovery
+        >>> cfm.fit(X)
+        >>>
+        >>> # Or with ordering hints (Bayesian prior)
+        >>> cfm.fit(X, causal_order_hint=['Rates', 'Spreads', 'Equities'])
         >>>
         >>> # Train the model
         >>> cfm.train(n_epochs=500)
@@ -159,7 +169,7 @@ class CausalFlowMatcher:
         >>> baseline = cfm.sample(1000)
         >>>
         >>> # Generate stress scenarios
-        >>> stressed = cfm.shock('VIX', magnitude=3.0, n_samples=1000)
+        >>> stressed = cfm.shock('Equities', magnitude=-3.0, n_samples=1000)
         >>>
         >>> # Save for later use
         >>> cfm.save('model_checkpoint.pt')
@@ -199,27 +209,36 @@ class CausalFlowMatcher:
     def fit(
         self,
         X: Union[np.ndarray, "pd.DataFrame"],
-        fast_vars: Optional[List[str]] = None,
-        slow_vars: Optional[List[str]] = None,
+        causal_order_hint: Optional[List[Union[str, int]]] = None,
         regime_response_vars: Optional[List[str]] = None,
         adf_threshold: float = 0.05,
         ctree_alpha: float = 0.05,
         ctree_min_split: int = 20,
-        causal_discovery_method: str = 'cam'
+        causal_discovery_method: str = 'cam',
+        # Deprecated parameters for backward compatibility
+        fast_vars: Optional[List[str]] = None,
+        slow_vars: Optional[List[str]] = None
     ) -> "CausalFlowMatcher":
         """Fit the preprocessing pipeline and initialize the model.
+
+        CAM discovers the causal ordering across ALL variables automatically.
+        Optionally, you can provide ordering hints (Bayesian prior) to constrain
+        the discovery while still testing against all variables.
 
         This performs:
         1. Data validation and cleaning (NaN imputation)
         2. Stationarity enforcement (ADF test + differencing)
-        3. Regime classification (CTree-Lite)
-        4. Causal graph discovery (CAM or LiNGAM on fast block)
+        3. Causal graph discovery (CAM or LiNGAM on ALL variables)
+        4. Regime classification (CTree-Lite)
         5. Model initialization with causal masking
 
         Args:
             X: Raw time series data of shape (T, D)
-            fast_vars: Names of fast (market) variables
-            slow_vars: Names of slow (macro) variables
+            causal_order_hint: Optional list of variable names/indices specifying
+                a partial ordering constraint. Variables listed will maintain their
+                relative order in the final result (Bayesian prior).
+                Example: ['Rates', 'Spreads', 'VIX'] ensures Rates before Spreads before VIX.
+                The full ordering of all variables is still discovered via CAM.
             regime_response_vars: Variables for regime detection
             adf_threshold: P-value threshold for stationarity test
             ctree_alpha: Significance threshold for regime splits
@@ -228,10 +247,20 @@ class CausalFlowMatcher:
                 Default is 'cam' (Causal Additive Models) which handles non-linear
                 financial relationships (convexity, thresholds). Use 'lingam' for
                 linear systems testing.
+            fast_vars: DEPRECATED - use causal_order_hint instead
+            slow_vars: DEPRECATED - use causal_order_hint instead
 
         Returns:
             self: Fitted instance
         """
+        # Handle deprecated parameters
+        if fast_vars is not None or slow_vars is not None:
+            warnings.warn(
+                "fast_vars and slow_vars are deprecated. Use causal_order_hint instead. "
+                "CAM now discovers ordering across ALL variables automatically.",
+                DeprecationWarning
+            )
+
         # Initialize processor
         self.processor = DataProcessor(
             adf_threshold=adf_threshold,
@@ -243,9 +272,10 @@ class CausalFlowMatcher:
         # Process data
         self.topology = self.processor.fit_transform(
             X,
+            causal_order_hint=causal_order_hint,
+            regime_response_vars=regime_response_vars,
             fast_vars=fast_vars,
-            slow_vars=slow_vars,
-            regime_response_vars=regime_response_vars
+            slow_vars=slow_vars
         )
 
         # Get dimensions
@@ -256,9 +286,10 @@ class CausalFlowMatcher:
         print(f"  State dimension: {state_dim}")
         print(f"  Number of regimes: {n_regimes}")
         print(f"  Samples: {len(self.topology.X_processed)}")
-        print(f"  Fast variables: {len(self.topology.fast_indices)}")
-        print(f"  Slow variables: {len(self.topology.slow_indices)}")
         print(f"  Causal discovery: {causal_discovery_method.upper()}")
+        print(f"  Causal order: {self.topology.variable_names[:3]}...{self.topology.variable_names[-3:]}"
+              if len(self.topology.variable_names) > 6 else f"  Causal order: {self.topology.variable_names}")
+        print(f"    (FAST/upstream first → SLOW/downstream sinks last)")
 
         # Initialize model
         self.model = VelocityNetwork(

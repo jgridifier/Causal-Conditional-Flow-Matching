@@ -6,8 +6,14 @@ Handles the complete preprocessing pipeline for time series data:
 2. Stationarity enforcement (ADF tests, differencing, log-returns)
 3. Normalization (StandardScaler for OT-Path stability)
 4. Regime classification (CTree-Lite based partitioning)
-5. Causal graph discovery (CAM or LiNGAM on "Fast" block)
+5. Causal graph discovery (CAM or LiNGAM on ALL variables)
 6. Variable reordering based on causal hierarchy
+
+Terminology (aligned with paper):
+- FAST (informationally fast) = UPSTREAM = drives other variables = FIRST in ordering
+  Example: Interest rates, Fed policy decisions
+- SLOW (informationally slow) = DOWNSTREAM = reacts to all others = SINK = LAST in ordering
+  Example: S&P 500 returns, VIX (reacts to everything)
 
 Causal Discovery Methods:
 - CAM (Causal Additive Models): Default method. Handles non-linear relationships
@@ -55,14 +61,15 @@ class DataTopology:
         regimes: Regime labels from CTree classification
         regime_embeddings: One-hot or learned embeddings for regimes
         causal_order: Permutation vector for variable ordering
+            (FAST/upstream variables first, SLOW/downstream sinks last)
         variable_names: Names of variables in causal order
         scaler_mean: Mean values for denormalization
         scaler_std: Standard deviations for denormalization
-        fast_indices: Indices of "fast" (market) variables
-        slow_indices: Indices of "slow" (macro) variables
         n_regimes: Number of detected regimes
         differenced_cols: Columns that were differenced for stationarity
         pca_components: PCA components if dimensionality reduction was applied
+        upstream_indices: Indices of upstream (fast) variables after reordering
+        downstream_indices: Indices of downstream (slow/sink) variables after reordering
     """
     X_processed: np.ndarray
     regimes: np.ndarray
@@ -71,12 +78,13 @@ class DataTopology:
     variable_names: List[str]
     scaler_mean: np.ndarray
     scaler_std: np.ndarray
-    fast_indices: np.ndarray
-    slow_indices: np.ndarray
     n_regimes: int
     differenced_cols: List[int] = field(default_factory=list)
     pca_components: Optional[np.ndarray] = None
     pca_mean: Optional[np.ndarray] = None
+    # Deprecated aliases for backward compatibility
+    fast_indices: np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
+    slow_indices: np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize topology to dictionary for saving."""
@@ -127,6 +135,10 @@ class DataProcessor:
     Implements the full ETL workflow from raw time series to
     normalized, causally-ordered, regime-labeled data.
 
+    Terminology (aligned with paper Section 3-4):
+    - FAST = informationally fast = UPSTREAM = drives other variables = FIRST
+    - SLOW = informationally slow = DOWNSTREAM = reacts to all = SINK = LAST
+
     Args:
         adf_threshold: P-value threshold for ADF stationarity test (default 0.05)
         max_diff_order: Maximum differencing order for stationarity (default 2)
@@ -139,15 +151,15 @@ class DataProcessor:
             relationships. Use 'lingam' for linear systems testing.
 
     Example:
+        >>> # Automatic causal discovery on all variables
         >>> processor = DataProcessor()
+        >>> topology = processor.fit_transform(X_raw)
+
+        >>> # With optional ordering hints (Bayesian prior)
         >>> topology = processor.fit_transform(
         ...     X_raw,
-        ...     fast_vars=['VIX', 'SPX_ret'],
-        ...     slow_vars=['GDP', 'CPI']
+        ...     causal_order_hint=['Rates', 'Spreads', 'VIX']  # Rates before Spreads before VIX
         ... )
-
-        >>> # For linear systems, use LiNGAM:
-        >>> processor = DataProcessor(causal_discovery_method='lingam')
     """
 
     SUPPORTED_CAUSAL_METHODS = ('cam', 'lingam')
@@ -184,22 +196,32 @@ class DataProcessor:
     def fit_transform(
         self,
         X: Union[np.ndarray, pl.DataFrame],
+        causal_order_hint: Optional[List[Union[str, int]]] = None,
+        regime_response_vars: Optional[List[str]] = None,
+        # Deprecated parameters for backward compatibility
         fast_vars: Optional[List[str]] = None,
-        slow_vars: Optional[List[str]] = None,
-        regime_response_vars: Optional[List[str]] = None
+        slow_vars: Optional[List[str]] = None
     ) -> DataTopology:
         """Full preprocessing pipeline: validate, clean, order, label.
+
+        CAM discovers the causal ordering across ALL variables automatically.
+        Optionally, you can provide ordering hints (Bayesian prior) to constrain
+        the discovery while still testing against all variables.
 
         Args:
             X: Raw time series data of shape (T, D)
                - If Polars DataFrame, column names are used for variable identification
-               - If ndarray, provide fast_vars and slow_vars as indices
-            fast_vars: Names/indices of "fast" market variables
-                       (e.g., VIX, daily returns, spreads)
-            slow_vars: Names/indices of "slow" macro variables
-                       (e.g., GDP, CPI, unemployment)
+               - If ndarray, variable names are auto-generated as var_0, var_1, ...
+            causal_order_hint: Optional list of variable names/indices specifying
+                a partial ordering constraint. Variables listed will maintain their
+                relative order in the final result.
+                Example: ['Rates', 'Spreads', 'VIX'] means Rates must come before
+                Spreads, which must come before VIX. Other variables are placed
+                based on CAM discovery.
             regime_response_vars: Variables to use as response for regime detection
-                                  (defaults to fast_vars if not specified)
+                (defaults to downstream/sink variables if not specified)
+            fast_vars: DEPRECATED - use causal_order_hint instead
+            slow_vars: DEPRECATED - use causal_order_hint instead
 
         Returns:
             DataTopology containing all processed data and metadata
@@ -208,57 +230,62 @@ class DataProcessor:
         X_array, variable_names = _to_numpy_array(X)
         n_vars = len(variable_names)
 
-        # Parse fast/slow variable specifications
-        fast_indices, slow_indices = self._parse_variable_blocks(
-            variable_names, fast_vars, slow_vars
+        # Handle deprecated parameters
+        if fast_vars is not None or slow_vars is not None:
+            warnings.warn(
+                "fast_vars and slow_vars are deprecated. Use causal_order_hint instead. "
+                "CAM now discovers ordering across ALL variables automatically.",
+                DeprecationWarning
+            )
+            # Convert old-style to new-style hint (fast_vars should come first)
+            if causal_order_hint is None and fast_vars is not None:
+                causal_order_hint = list(fast_vars)
+
+        # Parse ordering hints
+        ordering_constraints = self._parse_ordering_hints(
+            variable_names, causal_order_hint
         )
 
         # Step A: Validation and Cleaning
         X_clean, differenced_cols = self._validate_and_clean(X_array)
 
         # Step B: Dimensionality Reduction (if needed)
-        X_reduced, pca_info = self._apply_dimensionality_reduction(
-            X_clean, slow_indices
-        )
+        X_reduced, pca_info = self._apply_dimensionality_reduction(X_clean)
 
         # Step C: Normalize data
         X_normalized, scaler_mean, scaler_std = self._normalize(X_reduced)
 
-        # Step D: Regime Classification with CTree
-        if regime_response_vars is None:
-            # Use fast variables as regime indicators by default
-            regime_features = X_normalized[:, fast_indices] if len(fast_indices) > 0 else X_normalized
-        else:
-            regime_idx = [variable_names.index(v) for v in regime_response_vars if v in variable_names]
-            regime_features = X_normalized[:, regime_idx] if regime_idx else X_normalized
-
-        regimes, n_regimes = self._classify_regimes(X_normalized, regime_features)
-
-        # Step E: Causal Graph Discovery on Fast Block
+        # Step D: Causal Graph Discovery on ALL variables
         causal_order = self._discover_causal_order(
-            X_normalized, fast_indices, slow_indices
+            X_normalized, ordering_constraints
         )
 
         # Reorder data according to causal structure
         X_ordered = X_normalized[:, causal_order]
         ordered_names = [variable_names[i] for i in causal_order]
 
-        # Update fast/slow indices after reordering
-        fast_indices_new = np.array([
-            np.where(causal_order == i)[0][0]
-            for i in fast_indices
-            if i in causal_order
-        ])
-        slow_indices_new = np.array([
-            np.where(causal_order == i)[0][0]
-            for i in slow_indices
-            if i in causal_order
-        ])
+        # Step E: Regime Classification with CTree
+        # Use downstream (sink) variables as regime indicators by default
+        if regime_response_vars is None:
+            # Last 1/3 of variables are most downstream (sinks)
+            n_downstream = max(1, n_vars // 3)
+            regime_features = X_ordered[:, -n_downstream:]
+        else:
+            regime_idx = [ordered_names.index(v) for v in regime_response_vars if v in ordered_names]
+            regime_features = X_ordered[:, regime_idx] if regime_idx else X_ordered
+
+        regimes, n_regimes = self._classify_regimes(X_ordered, regime_features)
 
         # Create regime embeddings (one-hot)
         regime_embeddings = np.eye(n_regimes)[regimes]
 
         self._is_fitted = True
+
+        # For backward compatibility, set fast/slow indices
+        # Fast = first half (upstream), Slow = second half (downstream)
+        mid = n_vars // 2
+        fast_indices = np.arange(mid)
+        slow_indices = np.arange(mid, n_vars)
 
         return DataTopology(
             X_processed=X_ordered,
@@ -268,53 +295,52 @@ class DataProcessor:
             variable_names=ordered_names,
             scaler_mean=scaler_mean,
             scaler_std=scaler_std,
-            fast_indices=fast_indices_new,
-            slow_indices=slow_indices_new,
             n_regimes=n_regimes,
             differenced_cols=differenced_cols,
             pca_components=pca_info.get('components'),
-            pca_mean=pca_info.get('mean')
+            pca_mean=pca_info.get('mean'),
+            fast_indices=fast_indices,
+            slow_indices=slow_indices
         )
 
-    def _parse_variable_blocks(
+    def _parse_ordering_hints(
         self,
         variable_names: List[str],
-        fast_vars: Optional[List[str]],
-        slow_vars: Optional[List[str]]
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Parse fast and slow variable specifications."""
-        n_vars = len(variable_names)
+        causal_order_hint: Optional[List[Union[str, int]]]
+    ) -> List[Tuple[int, int]]:
+        """Parse user-provided ordering hints into pairwise constraints.
 
-        if fast_vars is None and slow_vars is None:
-            # Default: first half fast, second half slow
-            mid = n_vars // 2
-            fast_indices = np.arange(mid)
-            slow_indices = np.arange(mid, n_vars)
-        else:
-            # Parse string names or indices
-            if fast_vars is not None:
-                if all(isinstance(v, str) for v in fast_vars):
-                    fast_indices = np.array([
-                        variable_names.index(v) for v in fast_vars
-                        if v in variable_names
-                    ])
+        Args:
+            variable_names: List of all variable names
+            causal_order_hint: User-provided partial ordering
+
+        Returns:
+            constraints: List of (i, j) tuples meaning variable i must come before j
+        """
+        if causal_order_hint is None or len(causal_order_hint) < 2:
+            return []
+
+        # Convert to indices
+        indices = []
+        for v in causal_order_hint:
+            if isinstance(v, str):
+                if v in variable_names:
+                    indices.append(variable_names.index(v))
                 else:
-                    fast_indices = np.array(fast_vars)
+                    warnings.warn(f"Variable '{v}' not found in data, ignoring constraint.")
             else:
-                fast_indices = np.array([], dtype=int)
-
-            if slow_vars is not None:
-                if all(isinstance(v, str) for v in slow_vars):
-                    slow_indices = np.array([
-                        variable_names.index(v) for v in slow_vars
-                        if v in variable_names
-                    ])
+                if 0 <= v < len(variable_names):
+                    indices.append(v)
                 else:
-                    slow_indices = np.array(slow_vars)
-            else:
-                slow_indices = np.array([], dtype=int)
+                    warnings.warn(f"Index {v} out of range, ignoring constraint.")
 
-        return fast_indices, slow_indices
+        # Create pairwise constraints: each element must come before all following elements
+        constraints = []
+        for i in range(len(indices)):
+            for j in range(i + 1, len(indices)):
+                constraints.append((indices[i], indices[j]))
+
+        return constraints
 
     def _validate_and_clean(
         self,
@@ -496,13 +522,11 @@ class DataProcessor:
 
     def _apply_dimensionality_reduction(
         self,
-        X: np.ndarray,
-        slow_indices: np.ndarray
+        X: np.ndarray
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Apply PCA to slow block if dimensionality is too high.
+        """Apply PCA if dimensionality is too high.
 
-        Per spec: If D > 50, apply PCA to slow block only,
-        keeping fast variables explicit.
+        Per spec: If D > 50, apply PCA to reduce dimensions.
         """
         n_features = X.shape[1]
         pca_info: Dict[str, Any] = {}
@@ -510,36 +534,18 @@ class DataProcessor:
         if n_features <= self.max_features:
             return X, pca_info
 
-        if len(slow_indices) == 0:
-            return X, pca_info
-
-        # Extract slow block
-        slow_block = X[:, slow_indices]
-        n_slow = slow_block.shape[1]
-
-        # Determine number of components to keep
-        target_reduction = n_features - self.max_features
-        n_components = max(1, n_slow - target_reduction)
-        n_components = min(n_components, n_slow)
-
-        # Fit PCA on slow block
+        # Fit PCA
+        n_components = self.max_features
         self.pca = PCA(n_components=n_components)
-        slow_reduced = self.pca.fit_transform(slow_block)
+        X_reduced = self.pca.fit_transform(X)
 
         # Store PCA info for reconstruction
         pca_info['components'] = self.pca.components_
         pca_info['mean'] = self.pca.mean_
         pca_info['explained_variance'] = self.pca.explained_variance_ratio_.sum()
 
-        # Reconstruct X with reduced slow block
-        # Fast variables remain explicit
-        fast_indices = np.setdiff1d(np.arange(n_features), slow_indices)
-        fast_block = X[:, fast_indices]
-
-        X_reduced = np.hstack([fast_block, slow_reduced])
-
         warnings.warn(
-            f"Applied PCA to slow block: {n_slow} -> {n_components} dims "
+            f"Applied PCA: {n_features} -> {n_components} dims "
             f"(explained variance: {pca_info['explained_variance']:.2%})"
         )
 
@@ -589,107 +595,80 @@ class DataProcessor:
     def _discover_causal_order(
         self,
         X: np.ndarray,
-        fast_indices: np.ndarray,
-        slow_indices: np.ndarray
+        constraints: List[Tuple[int, int]]
     ) -> np.ndarray:
-        """Discover causal ordering using configured method.
+        """Discover causal ordering using configured method on ALL variables.
 
-        Dispatches to CAM (default) or LiNGAM based on causal_discovery_method.
-
-        Strategy:
-        1. Slow variables come first (macro drives markets)
-        2. Within fast block, use causal discovery to determine microstructure
-        3. CAM handles non-linear relationships via additive models
-        4. LiNGAM assumes linear non-Gaussian relationships
+        The ordering follows the paper's terminology:
+        - FIRST (low index) = FAST = informationally fast = upstream = drives others
+        - LAST (high index) = SLOW = informationally slow = downstream = sinks
 
         Args:
-            X: Normalized data matrix
-            fast_indices: Indices of fast (market) variables
-            slow_indices: Indices of slow (macro) variables
+            X: Normalized data matrix (all variables)
+            constraints: Pairwise ordering constraints from user hints
 
         Returns:
-            causal_order: Permutation of variable indices in causal order
+            causal_order: Permutation of variable indices
+                (upstream/fast first, downstream/slow sinks last)
         """
         n_features = X.shape[1]
 
-        if len(fast_indices) < 2:
-            # Not enough fast variables for causal discovery
-            # Order: slow first, then fast
-            result = np.concatenate([slow_indices, fast_indices])
-            return result.astype(int) if len(result) > 0 else np.arange(n_features, dtype=int)
-
-        # Extract fast block for causal discovery
-        fast_block = X[:, fast_indices]
+        if n_features < 2:
+            return np.arange(n_features, dtype=int)
 
         # Dispatch to appropriate method
         if self.causal_discovery_method == 'cam':
-            fast_ordered = self._discover_causal_order_cam(fast_block, fast_indices)
+            return self._discover_causal_order_cam(X, constraints)
         else:  # lingam
-            fast_ordered = self._discover_causal_order_lingam(fast_block, fast_indices)
-
-        # Final order: slow variables first (upstream), then fast (downstream)
-        causal_order = np.concatenate([slow_indices, fast_ordered])
-
-        return causal_order.astype(int)
+            return self._discover_causal_order_lingam(X, constraints)
 
     def _discover_causal_order_cam(
         self,
         X: np.ndarray,
-        indices: np.ndarray
+        constraints: List[Tuple[int, int]]
     ) -> np.ndarray:
         """Discover causal ordering using CAM (Causal Additive Models).
 
-        Uses greedy sink search algorithm:
+        Uses CONSTRAINED greedy sink search algorithm:
         1. For each variable, fit additive non-parametric regression on all others
-        2. Identify "sink" (variable best explained by others = lowest residual variance)
-        3. Place sink last in ordering, remove from set, repeat
-        4. Output is topological sort from root (most upstream) to sink (most downstream)
-
-        This method handles non-linear relationships (convexity, thresholds) common
-        in financial data that violate LiNGAM's linearity assumption.
+        2. Identify "sink" (variable best explained by others = highest R²)
+        3. Check sink doesn't violate user constraints
+        4. Place sink LAST in ordering, remove from set, repeat
+        5. Output is topological sort: FAST (upstream) first, SLOW (sinks) last
 
         Args:
-            X: Data matrix for fast block (n_samples, n_fast_vars)
-            indices: Original indices of variables in full data
+            X: Data matrix (n_samples, n_features)
+            constraints: Pairwise (i, j) constraints where i must come before j
 
         Returns:
-            ordered_indices: Original indices reordered by causal structure
+            causal_order: Variable indices in causal order
         """
         try:
-            # Try to use causal-learn CAM implementation
-            from causallearn.search.FCMBased.lingam import CAM_UV
-            return self._cam_causallearn(X, indices)
-        except ImportError:
-            pass
-
-        # Fall back to our implementation of greedy sink search with GAM
-        try:
-            return self._cam_greedy_sink_search(X, indices)
+            return self._cam_constrained_greedy_sink_search(X, constraints)
         except Exception as e:
             warnings.warn(
                 f"CAM failed ({e}). Using variance-based ordering. "
                 "Consider installing 'causal-learn' for better CAM support."
             )
-            return self._variance_based_order(X, indices)
+            return self._variance_based_order(X, constraints)
 
-    def _cam_greedy_sink_search(
+    def _cam_constrained_greedy_sink_search(
         self,
         X: np.ndarray,
-        indices: np.ndarray
+        constraints: List[Tuple[int, int]]
     ) -> np.ndarray:
-        """Greedy sink search algorithm for CAM ordering.
+        """Constrained greedy sink search algorithm for CAM ordering.
 
-        Implements the algorithm from Bühlmann et al. (2014):
-        - Iteratively identify the "sink" (most downstream variable)
-        - Sink is the variable best explained by all others (lowest residual variance)
-        - Build ordering from sinks (last) to roots (first)
+        Implements the algorithm from Bühlmann et al. (2014) with added
+        support for user-specified ordering constraints (Bayesian prior).
 
-        Uses generalized additive models (GAM) via sklearn's SplineTransformer
-        for non-parametric regression.
+        The algorithm respects constraints by only allowing a variable to be
+        selected as a sink if all variables that should come AFTER it (per
+        constraints) have already been placed.
 
         Args:
             X: Data matrix (n_samples, n_vars)
-            indices: Original indices of variables
+            constraints: List of (i, j) tuples meaning i must come before j
 
         Returns:
             ordered_indices: Indices in causal order (roots first, sinks last)
@@ -699,152 +678,99 @@ class DataProcessor:
         from sklearn.pipeline import make_pipeline
 
         n_samples, n_vars = X.shape
-        remaining = list(range(n_vars))
-        ordering = []
+        remaining = set(range(n_vars))
+        ordering = []  # Will be built from sinks to roots, then reversed
+
+        # Build constraint lookup: for each variable, which variables must come AFTER it?
+        must_come_after = {i: set() for i in range(n_vars)}
+        for (before, after) in constraints:
+            must_come_after[before].add(after)
 
         # Determine spline parameters based on sample size
         n_knots = min(5, max(2, n_samples // 50))
 
         while len(remaining) > 1:
             best_sink = None
-            best_score = -np.inf  # We want highest R² (lowest residual variance)
+            best_score = -np.inf
 
+            # Find valid sink candidates
+            # A variable can be a sink only if all variables that must come AFTER it
+            # have already been placed (i.e., are not in remaining)
+            valid_candidates = []
             for i in remaining:
+                # Check if all "must come after" variables have been placed
+                unplaced_after = must_come_after[i] & remaining
+                if len(unplaced_after) == 0:
+                    valid_candidates.append(i)
+
+            if not valid_candidates:
+                # Constraint conflict - fall back to ignoring constraints
+                warnings.warn(
+                    "Ordering constraints are inconsistent. Ignoring constraints."
+                )
+                valid_candidates = list(remaining)
+
+            for i in valid_candidates:
                 # Get predictors (all other remaining variables)
-                predictor_idx = [j for j in remaining if j != i]
-                X_pred = X[:, predictor_idx]
+                remaining_list = list(remaining)
+                predictor_idx = [remaining_list.index(j) for j in remaining if j != i]
+                X_remaining = X[:, list(remaining)]
+                X_pred = X_remaining[:, predictor_idx]
                 y = X[:, i]
 
-                try:
-                    # Fit GAM: y_i = sum_j f_j(x_j) + epsilon
-                    # Using additive spline regression
-                    model = make_pipeline(
-                        SplineTransformer(
-                            n_knots=n_knots,
-                            degree=3,
-                            include_bias=False
-                        ),
-                        Ridge(alpha=1.0)
-                    )
-                    model.fit(X_pred, y)
+                if len(predictor_idx) == 0:
+                    score = 0.0
+                else:
+                    try:
+                        # Fit GAM: y_i = sum_j f_j(x_j) + epsilon
+                        model = make_pipeline(
+                            SplineTransformer(
+                                n_knots=n_knots,
+                                degree=3,
+                                include_bias=False
+                            ),
+                            Ridge(alpha=1.0)
+                        )
+                        model.fit(X_pred, y)
 
-                    # Calculate R² score (higher = better explained = more sink-like)
-                    score = model.score(X_pred, y)
+                        # Calculate R² score (higher = better explained = more sink-like)
+                        score = model.score(X_pred, y)
 
-                except Exception:
-                    # If fitting fails, use simple correlation-based score
-                    correlations = [np.abs(np.corrcoef(X[:, j], y)[0, 1])
-                                    for j in predictor_idx]
-                    score = np.mean([c for c in correlations if np.isfinite(c)])
+                    except Exception:
+                        # If fitting fails, use correlation-based score
+                        correlations = []
+                        for j_idx, j in enumerate(predictor_idx):
+                            j_orig = remaining_list[j]
+                            corr = np.abs(np.corrcoef(X[:, j_orig], y)[0, 1])
+                            if np.isfinite(corr):
+                                correlations.append(corr)
+                        score = np.mean(correlations) if correlations else 0.0
 
                 if score > best_score:
                     best_score = score
                     best_sink = i
 
+            if best_sink is None:
+                # Should not happen, but fallback
+                best_sink = list(remaining)[0]
+
             # Add sink to ordering (will be reversed at end)
             ordering.append(best_sink)
             remaining.remove(best_sink)
 
-        # Add the last remaining variable (it's the root)
+        # Add the last remaining variable (it's the root - most upstream)
         if remaining:
-            ordering.append(remaining[0])
+            ordering.append(list(remaining)[0])
 
-        # Reverse: we built from sinks to roots, but want roots first
+        # Reverse: we built from sinks to roots, but want roots (FAST) first
         ordering = ordering[::-1]
 
-        # Map back to original indices
-        return indices[np.array(ordering)]
-
-    def _cam_causallearn(
-        self,
-        X: np.ndarray,
-        indices: np.ndarray
-    ) -> np.ndarray:
-        """Use causal-learn library's CAM implementation.
-
-        Args:
-            X: Data matrix (n_samples, n_vars)
-            indices: Original indices of variables
-
-        Returns:
-            ordered_indices: Indices in causal order
-        """
-        try:
-            # causal-learn CAM returns adjacency matrix, extract ordering
-            from causallearn.search.ScoreBased.GES import ges
-            from causallearn.search.FCMBased.lingam import DirectLiNGAM
-
-            # Use GES (Greedy Equivalence Search) with BIC score as a proxy
-            # since CAM implementation varies by version
-            record = ges(X, score_func='local_score_BIC')
-            adj_matrix = record['G'].graph
-
-            # Convert adjacency to topological order
-            return self._adjacency_to_order(adj_matrix, indices)
-
-        except Exception as e:
-            warnings.warn(f"causal-learn CAM failed ({e}), using greedy sink search.")
-            return self._cam_greedy_sink_search(X, indices)
-
-    def _adjacency_to_order(
-        self,
-        adj_matrix: np.ndarray,
-        indices: np.ndarray
-    ) -> np.ndarray:
-        """Convert adjacency matrix to topological ordering.
-
-        Uses Kahn's algorithm for topological sort.
-
-        Args:
-            adj_matrix: Adjacency matrix where adj[i,j]=1 means i->j
-            indices: Original indices of variables
-
-        Returns:
-            ordered_indices: Indices in topological order
-        """
-        n = len(adj_matrix)
-
-        # Compute in-degrees
-        # Handle different adjacency matrix formats
-        # adj[i,j] = 1 means edge from i to j, so in-degree of j is sum of column j
-        in_degree = np.zeros(n, dtype=int)
-
-        for j in range(n):
-            for i in range(n):
-                if i != j and adj_matrix[i, j] != 0:
-                    # Check for directed edge i -> j
-                    # In CPDAG notation: adj[i,j]=1 and adj[j,i]=0 means i->j
-                    if adj_matrix[j, i] == 0:
-                        in_degree[j] += 1
-
-        # Kahn's algorithm
-        order = []
-        queue = [i for i in range(n) if in_degree[i] == 0]
-
-        while queue:
-            node = queue.pop(0)
-            order.append(node)
-
-            for j in range(n):
-                if node != j and adj_matrix[node, j] != 0 and adj_matrix[j, node] == 0:
-                    in_degree[j] -= 1
-                    if in_degree[j] == 0:
-                        queue.append(j)
-
-        # If not all nodes added (cycle detected), fall back to variance-based
-        if len(order) != n:
-            warnings.warn("Graph has cycles, using variance-based ordering.")
-            return self._variance_based_order(
-                np.zeros((1, n)),  # Dummy, won't be used
-                indices
-            )
-
-        return indices[np.array(order)]
+        return np.array(ordering, dtype=int)
 
     def _discover_causal_order_lingam(
         self,
         X: np.ndarray,
-        indices: np.ndarray
+        constraints: List[Tuple[int, int]]
     ) -> np.ndarray:
         """Discover causal ordering using LiNGAM.
 
@@ -857,48 +783,71 @@ class DataProcessor:
         For non-linear financial data, consider using 'cam' method instead.
 
         Args:
-            X: Data matrix for fast block (n_samples, n_fast_vars)
-            indices: Original indices of variables in full data
+            X: Data matrix (n_samples, n_features)
+            constraints: Pairwise constraints (used for fallback only)
 
         Returns:
-            ordered_indices: Original indices reordered by causal structure
+            causal_order: Variable indices in causal order
         """
         try:
-            # Import LiNGAM dynamically to allow graceful fallback
             import lingam
 
-            # Fit DirectLiNGAM to discover causal order
             model = lingam.DirectLiNGAM()
             model.fit(X)
 
-            # Get causal order (indices into fast_indices)
-            fast_causal_order = model.causal_order_
-
-            # Map back to original indices
-            return indices[fast_causal_order]
+            return np.array(model.causal_order_, dtype=int)
 
         except ImportError:
             warnings.warn("lingam not available. Using variance-based ordering.")
-            return self._variance_based_order(X, indices)
+            return self._variance_based_order(X, constraints)
 
         except Exception as e:
             warnings.warn(f"LiNGAM failed ({e}). Using variance-based ordering.")
-            return self._variance_based_order(X, indices)
+            return self._variance_based_order(X, constraints)
 
     def _variance_based_order(
         self,
         X: np.ndarray,
-        indices: np.ndarray
+        constraints: List[Tuple[int, int]]
     ) -> np.ndarray:
-        """Fallback ordering: higher variance = faster reaction.
+        """Fallback ordering based on variance.
 
-        Intuition: Market variables with higher variance tend to react
-        faster to shocks and are more downstream in the causal chain.
+        Intuition from Section 3 of paper:
+        - Variables that react to everything (sinks) have HIGHER variance
+        - Fundamental drivers have LOWER variance (more stable)
+        - Therefore: LOW variance first (upstream/FAST), HIGH variance last (downstream/SLOW)
+
+        Args:
+            X: Data matrix
+            constraints: Pairwise constraints (respected if possible)
+
+        Returns:
+            ordered_indices: Indices in causal order
         """
+        n_vars = X.shape[1]
         variances = np.var(X, axis=0)
-        # Lower variance first (slow), higher variance last (fast)
-        order = np.argsort(variances)
-        return indices[order]
+
+        # Start with variance-based ordering
+        # Low variance = upstream (FAST) = first
+        # High variance = downstream (SLOW/sink) = last
+        base_order = np.argsort(variances)
+
+        if not constraints:
+            return base_order
+
+        # Adjust for constraints using topological sort
+        # Build a graph and do constrained sorting
+        order_list = list(base_order)
+
+        for (before, after) in constraints:
+            before_pos = order_list.index(before)
+            after_pos = order_list.index(after)
+            if before_pos > after_pos:
+                # Constraint violated, swap
+                order_list.remove(before)
+                order_list.insert(after_pos, before)
+
+        return np.array(order_list, dtype=int)
 
     def transform(
         self,
@@ -957,6 +906,22 @@ class DataProcessor:
         X_original = X_reordered * topology.scaler_std + topology.scaler_mean
 
         return X_original
+
+    # Backward compatibility methods
+    def _parse_variable_blocks(
+        self,
+        variable_names: List[str],
+        fast_vars: Optional[List[str]],
+        slow_vars: Optional[List[str]]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """DEPRECATED: Parse fast and slow variable specifications."""
+        warnings.warn(
+            "_parse_variable_blocks is deprecated. CAM now discovers ordering automatically.",
+            DeprecationWarning
+        )
+        n_vars = len(variable_names)
+        mid = n_vars // 2
+        return np.arange(mid), np.arange(mid, n_vars)
 
 
 def validate_for_ode(X: np.ndarray) -> None:
