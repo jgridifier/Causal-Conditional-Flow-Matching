@@ -115,6 +115,82 @@ class VelocityFieldWrapper(nn.Module):
         return self.model(x, t_batch, regime)
 
 
+class TemporalGuidedVelocityField(nn.Module):
+    """Velocity field with time-varying guidance for temporal forecasting.
+
+    Supports guiding multiple variables along predefined trajectories
+    during integration. This is useful for constrained forecasting where
+    certain variables follow known or prescribed paths.
+
+    The correction term for each constrained variable at each time is:
+        correction[i] = guidance_strength * (target_trajectory[i](t) - x[i]) / (1 - t + eps)
+
+    Args:
+        model: The VelocityNetwork
+        regime: Regime conditioning
+        target_trajectories: Dict mapping variable index to callable (t -> target_value)
+                            or to a fixed value (same target for all t)
+        guidance_strength: Strength of guidance (default 1.0)
+        eps: Small constant to prevent division by zero (default 1e-4)
+    """
+
+    def __init__(
+        self,
+        model: VelocityNetwork,
+        regime: torch.Tensor,
+        target_trajectories: Dict[int, Union[float, Callable[[float], float]]],
+        guidance_strength: float = 1.0,
+        eps: float = 1e-4
+    ):
+        super().__init__()
+        self.model = model
+        self.regime = regime
+        self.target_trajectories = target_trajectories
+        self.guidance_strength = guidance_strength
+        self.eps = eps
+
+    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Compute guided velocity field with time-varying targets.
+
+        Args:
+            t: Scalar time value
+            x: State tensor of shape (batch, dim)
+
+        Returns:
+            v_guided: Guided velocity tensor of shape (batch, dim)
+        """
+        batch_size = x.shape[0]
+
+        if t.dim() == 0:
+            t_batch = t.expand(batch_size)
+            t_scalar = t.item()
+        else:
+            t_batch = t
+            t_scalar = t[0].item() if t.shape[0] > 0 else 0.0
+
+        regime = self.regime
+        if regime.shape[0] == 1 and batch_size > 1:
+            regime = regime.expand(batch_size)
+
+        # Compute nominal velocity
+        v_guided = self.model(x, t_batch, regime).clone()
+
+        # Apply guidance to each constrained variable
+        remaining_time = 1.0 - t_scalar + self.eps
+        for idx, target_spec in self.target_trajectories.items():
+            # Get target value at current time
+            if callable(target_spec):
+                target_value = target_spec(t_scalar)
+            else:
+                target_value = target_spec
+
+            gap = target_value - x[:, idx]
+            correction = self.guidance_strength * gap / remaining_time
+            v_guided[:, idx] = v_guided[:, idx] + correction
+
+        return v_guided
+
+
 class GuidedVelocityField(nn.Module):
     """Velocity field with guidance for stress testing.
 
@@ -500,6 +576,228 @@ class ODESolver:
         if idx < len(self.topology.variable_names):
             return self.topology.variable_names[idx]
         return f"var_{idx}"
+
+    @torch.no_grad()
+    def forecast_step(
+        self,
+        x_prev: torch.Tensor,
+        regime: Union[int, torch.Tensor],
+        noise_scale: float = 0.1,
+        constraints: Optional[Dict[int, float]] = None,
+        guidance_strength: float = 1.0
+    ) -> torch.Tensor:
+        """Generate one forecasting step conditioned on previous state.
+
+        This implements autoregressive forecasting by using the previous
+        state as the starting point (with noise) and integrating forward.
+
+        Args:
+            x_prev: Previous state tensor of shape (n_samples, dim) in NORMALIZED space
+            regime: Regime label
+            noise_scale: Scale of noise to add to x_prev before integrating (default 0.1)
+            constraints: Optional dict mapping variable index to target value
+            guidance_strength: Strength of guidance for constraints
+
+        Returns:
+            x_next: Next state tensor of shape (n_samples, dim) in normalized space
+        """
+        self.model.eval()
+        n_samples = x_prev.shape[0]
+
+        # Add noise to previous state for diversity (this creates the "innovation")
+        # The noise scale controls how much the forecast can deviate from conditioning
+        x_0 = x_prev + noise_scale * torch.randn_like(x_prev)
+
+        # Prepare regime
+        if isinstance(regime, int):
+            regime_tensor = torch.full((n_samples,), regime, dtype=torch.long, device=self.device)
+        else:
+            regime_tensor = regime.to(self.device)
+
+        # Choose velocity field based on whether we have constraints
+        if constraints and len(constraints) > 0:
+            velocity_fn = TemporalGuidedVelocityField(
+                self.model,
+                regime_tensor,
+                target_trajectories=constraints,
+                guidance_strength=guidance_strength
+            )
+        else:
+            velocity_fn = VelocityFieldWrapper(self.model, regime_tensor)
+
+        # Integrate
+        integrator = odeint_adjoint if self.config.use_adjoint else odeint
+        trajectory = integrator(
+            velocity_fn,
+            x_0,
+            self.t_span,
+            method=self.config.method,
+            rtol=self.config.rtol,
+            atol=self.config.atol,
+            options={'max_num_steps': self.config.max_num_steps}
+        )
+
+        return trajectory[-1]
+
+    @torch.no_grad()
+    def forecast_paths(
+        self,
+        n_paths: int,
+        n_steps: int,
+        regime: Union[int, torch.Tensor],
+        noise_scale: float = 0.1,
+        constraint_trajectories: Optional[Dict[int, np.ndarray]] = None,
+        guidance_strength: float = 1.0,
+        initial_state: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Generate multi-step autoregressive forecasting paths.
+
+        This is the core temporal forecasting method. It generates paths by:
+        1. Starting from either a provided initial state or sampling from noise
+        2. At each step, using the previous state as conditioning
+        3. Optionally enforcing constraint trajectories on specific variables
+
+        Args:
+            n_paths: Number of scenario paths to generate
+            n_steps: Number of time steps to forecast
+            regime: Regime label (can change per step if tensor provided)
+            noise_scale: Innovation noise scale (higher = more diversity between steps)
+            constraint_trajectories: Optional dict mapping variable index to
+                                    array of target values of shape (n_steps,)
+            guidance_strength: Strength of guidance for constraints
+            initial_state: Optional initial state (n_paths, dim) in normalized space.
+                          If None, samples from the learned distribution.
+
+        Returns:
+            paths: Tensor of shape (n_paths, n_steps, dim) in normalized space
+
+        Example:
+            >>> # Unconstrained forecast
+            >>> paths = solver.forecast_paths(n_paths=100, n_steps=36, regime=0)
+            >>>
+            >>> # Constrained forecast (VIX follows a rising path)
+            >>> vix_trajectory = np.linspace(0, 2.5, 36)  # Rising from 0 to 2.5 std
+            >>> paths = solver.forecast_paths(
+            ...     n_paths=100, n_steps=36, regime=0,
+            ...     constraint_trajectories={vix_idx: vix_trajectory}
+            ... )
+        """
+        self.model.eval()
+        dim = self.model.state_dim
+
+        # Initialize paths storage
+        paths = torch.empty((n_paths, n_steps, dim), device=self.device)
+
+        # Generate initial state
+        if initial_state is not None:
+            x_current = initial_state.to(self.device)
+        else:
+            # Sample initial state from the model's learned distribution
+            x_current = self.sample(n_paths, regime if isinstance(regime, int) else regime[0])
+
+        # Prepare regime handling
+        if isinstance(regime, int):
+            regime_per_step = [regime] * n_steps
+        elif isinstance(regime, (list, np.ndarray)):
+            regime_per_step = regime
+        else:
+            regime_per_step = [regime] * n_steps
+
+        # Generate each step autoregressively
+        for step in range(n_steps):
+            current_regime = regime_per_step[step] if step < len(regime_per_step) else regime_per_step[-1]
+
+            # Get constraints for this step if any
+            step_constraints = None
+            if constraint_trajectories:
+                step_constraints = {}
+                for idx, trajectory in constraint_trajectories.items():
+                    if step < len(trajectory):
+                        step_constraints[idx] = float(trajectory[step])
+
+            # Generate next state
+            x_next = self.forecast_step(
+                x_current,
+                current_regime,
+                noise_scale=noise_scale,
+                constraints=step_constraints,
+                guidance_strength=guidance_strength
+            )
+
+            # Store and update
+            paths[:, step, :] = x_next
+            x_current = x_next
+
+        return paths
+
+    @torch.no_grad()
+    def sample_temporal_guided(
+        self,
+        n_samples: int,
+        target_trajectories: Dict[int, Union[float, Callable[[float], float]]],
+        regime: Union[int, torch.Tensor],
+        guidance_strength: float = 1.0,
+        return_trajectory: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Generate samples with time-varying guidance on multiple variables.
+
+        This allows guiding variables along continuous trajectories during
+        a single ODE integration step. Useful for smooth transitions.
+
+        Args:
+            n_samples: Number of samples
+            target_trajectories: Dict mapping variable index to either:
+                                - float: constant target throughout integration
+                                - callable: function of t returning target value
+            regime: Regime label
+            guidance_strength: Guidance strength
+            return_trajectory: Whether to return integration trajectory
+
+        Returns:
+            samples: Guided samples of shape (n_samples, dim)
+            trajectory: (optional) Full trajectory of shape (n_steps, n_samples, dim)
+        """
+        self.model.eval()
+        dim = self.model.state_dim
+
+        # Sample from noise prior
+        x_0 = torch.randn(n_samples, dim, device=self.device)
+
+        # Prepare regime
+        if isinstance(regime, int):
+            regime_tensor = torch.full((n_samples,), regime, dtype=torch.long, device=self.device)
+        else:
+            regime_tensor = regime.to(self.device)
+
+        # Create temporal guided velocity field
+        velocity_fn = TemporalGuidedVelocityField(
+            self.model,
+            regime_tensor,
+            target_trajectories=target_trajectories,
+            guidance_strength=guidance_strength
+        )
+
+        # Integrate
+        integrator = odeint_adjoint if self.config.use_adjoint else odeint
+        if return_trajectory:
+            t_eval = torch.linspace(0, 1, self.config.n_steps + 1, device=self.device)
+        else:
+            t_eval = self.t_span
+
+        trajectory = integrator(
+            velocity_fn,
+            x_0,
+            t_eval,
+            method=self.config.method,
+            rtol=self.config.rtol,
+            atol=self.config.atol,
+            options={'max_num_steps': self.config.max_num_steps}
+        )
+
+        if return_trajectory:
+            return trajectory[-1], trajectory
+        else:
+            return trajectory[-1]
 
 
 class ScenarioGenerator:

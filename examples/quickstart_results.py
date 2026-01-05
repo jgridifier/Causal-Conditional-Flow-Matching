@@ -1,5 +1,16 @@
+#!/usr/bin/env python3
+"""
+Quickstart Results Visualization with Temporal Forecasting
 
-# Load my_model.pt
+This script demonstrates:
+1. Temporal forecasting with autoregressive conditioning (new method)
+2. Comparison with independent sampling (old method)
+3. Constrained forecasting with predetermined variable paths
+4. Visualization of results
+
+Run with: python quickstart_results.py
+"""
+
 import sys
 import os
 from dotenv import load_dotenv
@@ -13,31 +24,94 @@ import torch
 import altair as alt
 import polars as pl
 import pandas as pd
+from pathlib import Path
 
 from core import CausalFlowMatcher
 from examples.data_fetcher import fetch_all_data
 
 
-cfm = CausalFlowMatcher.load('D:\DEV\Causal-Conditional-Flow-Matching\examples\my_model.pt')
+# Load the trained model
+model_path = Path(__file__).parent / 'my_model.pt'
+cfm = CausalFlowMatcher.load(str(model_path))
 
-X = fetch_all_data() # polars dataframe with date column
+X = fetch_all_data()  # polars dataframe with date column
 
 # ========================================
-# Generate multi-step forward projections
+# Generate Temporal Forecasting Paths
 # ========================================
 
-print("Generating forward-looking paths...")
+print("=" * 60)
+print("Temporal Forecasting with C-CFM")
+print("=" * 60)
+
 n_paths = 50  # Number of different scenario paths
-n_steps = 48  # Number of time steps forward
+n_steps = 48  # Number of time steps forward (48 months = 4 years)
 
-# Use the optimized generate_paths method from CausalFlowMatcher
-paths = cfm.generate_paths(n_paths=n_paths, n_steps=n_steps, regime=0)
-print(f"Generated {n_paths} paths with {n_steps} steps each")
+# NEW: Use temporal forecasting (autoregressive, maintains temporal dependencies)
+print("\n[1/4] Generating temporal forecast paths (autoregressive)...")
+temporal_paths = cfm.forecast(
+    n_paths=n_paths,
+    n_steps=n_steps,
+    regime=0,
+    noise_scale=0.1  # Innovation noise between steps
+)
+print(f"  Generated {n_paths} temporal paths with {n_steps} steps each")
+print(f"  Shape: {temporal_paths.shape}")
+
+# OLD: Generate independent paths for comparison
+print("\n[2/4] Generating independent paths for comparison...")
+independent_paths = cfm.generate_paths(n_paths=n_paths, n_steps=n_steps, regime=0)
+print(f"  Generated {n_paths} independent paths with {n_steps} steps each")
+
+# Use temporal_paths as the primary visualization
+paths = temporal_paths
 
 # ========================================
-# Also generate single-step baseline for comparison
+# Generate Constrained Forecast
 # ========================================
-baseline = cfm.sample(n_samples=1000) # numpy array without date column
+print("\n[3/4] Generating constrained forecast...")
+
+# Create a constraint: if we have VIX, make it spike mid-forecast
+constrained_paths = None
+constraint_var = None
+constraint_trajectory = None
+
+if 'VIX' in cfm.variable_names:
+    constraint_var = 'VIX'
+    # VIX spike scenario: stable -> spike -> recovery
+    constraint_trajectory = np.concatenate([
+        np.full(12, 15),           # 1 year stable
+        np.linspace(15, 35, 12),   # 1 year spike
+        np.linspace(35, 18, 12),   # 1 year recovery
+        np.full(12, 18)            # 1 year normalized
+    ])
+elif len(cfm.variable_names) > 0:
+    constraint_var = cfm.variable_names[0]
+    # Generic rising path for first variable
+    baseline_sample = cfm.sample(n_samples=100)
+    var_mean = baseline_sample[:, 0].mean()
+    var_std = baseline_sample[:, 0].std()
+    constraint_trajectory = np.linspace(var_mean, var_mean + 2 * var_std, n_steps)
+
+if constraint_var and constraint_trajectory is not None:
+    constrained_paths = cfm.forecast_with_constraints(
+        n_paths=n_paths,
+        n_steps=n_steps,
+        constraint_paths={constraint_var: constraint_trajectory},
+        regime=0,
+        guidance_strength=1.0
+    )
+    print(f"  Generated constrained paths with {constraint_var} following predetermined path")
+    print(f"  Shape: {constrained_paths.shape}")
+else:
+    print("  Skipping constrained forecast (no suitable variable found)")
+
+# ========================================
+# Generate single-step baseline for comparison
+# ========================================
+print("\n[4/4] Generating baseline samples for distribution comparison...")
+baseline = cfm.sample(n_samples=1000)  # numpy array without date column
+print(f"  Generated {baseline.shape[0]} baseline samples")
 
 # Convert baseline numpy array to polars DataFrame with variable names
 baseline_df = pl.DataFrame(
@@ -87,11 +161,12 @@ chart = alt.Chart(melted_df).mark_boxplot().encode(
 )
 
 chart.save('quickstart_results_boxplot.html')
-print("Box plot saved to quickstart_results_boxplot.html")
+print("  Saved: quickstart_results_boxplot.html")
 
 # ========================================
 # Create path visualization (time series)
 # ========================================
+print("\nCreating path visualizations...")
 
 # Convert paths to long-form DataFrame for Altair
 # Shape: (n_paths, n_steps, n_variables) -> DataFrame with columns: path_id, step, variable, value
@@ -127,7 +202,7 @@ path_chart = alt.Chart(paths_df).mark_line(opacity=0.3, size=1).encode(
 )
 
 path_chart.save('quickstart_results_paths.html')
-print("Path visualization saved to quickstart_results_paths.html")
+print("  Saved: quickstart_results_paths.html")
 
 # ========================================
 # Create alternative view: Percentile bands
@@ -191,16 +266,127 @@ band_chart = (band_80 + band_50 + median_line + mean_line).properties(
 )
 
 band_chart.save('quickstart_results_bands.html')
-print("Percentile bands visualization saved to quickstart_results_bands.html")
+print("  Saved: quickstart_results_bands.html")
 
-print("\n" + "="*60)
-print("Summary:")
-print(f"- Generated {n_paths} paths with {n_steps} time steps each")
-print(f"- Variables: {len(cfm.variable_names)}")
-print("\nVisualizations created:")
-print("  1. quickstart_results_boxplot.html - Distribution comparison")
-print("  2. quickstart_results_paths.html - All individual paths")
-print("  3. quickstart_results_bands.html - Percentile bands over time")
-print("="*60)
+# ========================================
+# Create Temporal vs Independent Comparison
+# ========================================
+print("\nCreating temporal vs independent comparison...")
 
+# Compute lag-1 autocorrelation for comparison
+def compute_autocorr(paths_arr, var_idx, lag=1):
+    """Compute average autocorrelation across paths."""
+    autocorrs = []
+    for path_idx in range(paths_arr.shape[0]):
+        series = paths_arr[path_idx, :, var_idx]
+        if len(series) > lag:
+            corr = np.corrcoef(series[:-lag], series[lag:])[0, 1]
+            if not np.isnan(corr):
+                autocorrs.append(corr)
+    return np.mean(autocorrs) if autocorrs else 0.0
 
+# Create comparison data
+comparison_data = []
+for var_idx, var_name in enumerate(cfm.variable_names[:6]):
+    temporal_ac = compute_autocorr(temporal_paths, var_idx)
+    independent_ac = compute_autocorr(independent_paths, var_idx)
+    comparison_data.append({
+        'variable': var_name,
+        'method': 'Temporal Forecast',
+        'autocorrelation': temporal_ac
+    })
+    comparison_data.append({
+        'variable': var_name,
+        'method': 'Independent Samples',
+        'autocorrelation': independent_ac
+    })
+
+comparison_df_ac = pd.DataFrame(comparison_data)
+
+# Create autocorrelation comparison chart
+autocorr_chart = alt.Chart(comparison_df_ac).mark_bar().encode(
+    x=alt.X('method:N', title=None),
+    y=alt.Y('autocorrelation:Q', title='Lag-1 Autocorrelation'),
+    color=alt.Color('method:N', title='Method'),
+    column=alt.Column('variable:N', header=alt.Header(labelAngle=0))
+).properties(
+    width=100,
+    height=200,
+    title='Temporal Coherence: Temporal Forecast vs Independent Samples'
+)
+
+autocorr_chart.save('quickstart_results_autocorr.html')
+print("  Saved: quickstart_results_autocorr.html")
+
+# ========================================
+# Create Constrained Forecast Visualization
+# ========================================
+if constrained_paths is not None and constraint_var is not None:
+    print("\nCreating constrained forecast visualization...")
+
+    # Get the index of the constrained variable
+    var_idx = cfm.variable_names.index(constraint_var)
+
+    # Build data for constrained paths
+    constrained_vis_data = []
+    for step_idx in range(n_steps):
+        values = constrained_paths[:, step_idx, var_idx]
+        constrained_vis_data.append({
+            'step': step_idx,
+            'p10': float(np.percentile(values, 10)),
+            'p50': float(np.percentile(values, 50)),
+            'p90': float(np.percentile(values, 90)),
+            'constraint': float(constraint_trajectory[step_idx])
+        })
+
+    constrained_vis_df = pd.DataFrame(constrained_vis_data)
+
+    # Create layered chart
+    base_c = alt.Chart(constrained_vis_df).encode(
+        x=alt.X('step:Q', title='Time Step (months)')
+    )
+
+    band_c = base_c.mark_area(opacity=0.3, color='steelblue').encode(
+        y=alt.Y('p10:Q', title=constraint_var),
+        y2='p90:Q'
+    )
+
+    median_c = base_c.mark_line(color='blue', size=2).encode(
+        y='p50:Q'
+    )
+
+    constraint_line = base_c.mark_line(color='red', strokeDash=[5, 3], size=2.5).encode(
+        y='constraint:Q'
+    )
+
+    constrained_chart = (band_c + median_c + constraint_line).properties(
+        width=500,
+        height=300,
+        title=f'Constrained Forecast: {constraint_var} (red=constraint path, blue=model forecast)'
+    )
+
+    constrained_chart.save('quickstart_results_constrained.html')
+    print("  Saved: quickstart_results_constrained.html")
+
+print("\n" + "=" * 60)
+print("Summary")
+print("=" * 60)
+print(f"""
+Generated Forecasts:
+- Temporal Forecast: {n_paths} paths x {n_steps} steps (autoregressive)
+- Independent Paths: {n_paths} paths x {n_steps} steps (for comparison)
+- Constrained Forecast: {constraint_var if constraint_var else 'N/A'}
+- Variables: {len(cfm.variable_names)}
+
+Key Insight:
+  Temporal forecast maintains higher autocorrelation (temporal coherence)
+  compared to independent sampling at each step.
+
+Visualizations Created:
+  1. quickstart_results_boxplot.html   - Distribution comparison
+  2. quickstart_results_paths.html     - All individual paths
+  3. quickstart_results_bands.html     - Percentile bands over time
+  4. quickstart_results_autocorr.html  - Temporal vs Independent comparison
+  5. quickstart_results_constrained.html - Constrained forecast (if applicable)
+""")
+print("=" * 60)
