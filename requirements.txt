@@ -34,3 +34,5 @@ jupyter>=1.0.0
 ipykernel>=6.0.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
+
+pyarrow>=20.0.0

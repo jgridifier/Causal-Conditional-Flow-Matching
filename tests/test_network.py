@@ -24,7 +24,9 @@ from core.network import (
     FiLMLayer,
     SinusoidalTimeEmbedding,
     ResidualBlock,
-    create_causal_mask
+    create_causal_mask,
+    assign_degrees,
+    create_hidden_mask
 )
 
 
@@ -496,6 +498,213 @@ class TestNetworkRepr:
         assert "in_features=10" in repr_str
         assert "out_features=20" in repr_str
         assert "masked=True" in repr_str
+
+
+class TestMADEMasking:
+    """Test MADE-compliant degree-based masking system."""
+
+    def test_assign_degrees_basic(self):
+        """Test basic degree assignment."""
+        hidden_dim = 8
+        state_dim = 4
+
+        degrees = assign_degrees(hidden_dim, state_dim)
+
+        assert len(degrees) == hidden_dim
+        assert degrees.min() == 0
+        assert degrees.max() == state_dim - 1
+        # Each degree should appear at least once
+        assert len(np.unique(degrees)) == state_dim
+
+    def test_assign_degrees_even_distribution(self):
+        """Test that degrees are distributed evenly."""
+        hidden_dim = 12
+        state_dim = 4
+
+        degrees = assign_degrees(hidden_dim, state_dim)
+
+        # Each degree should appear exactly 3 times
+        for d in range(state_dim):
+            assert np.sum(degrees == d) == 3
+
+    def test_assign_degrees_error_too_small(self):
+        """Test error when hidden_dim is too small."""
+        with pytest.raises(ValueError, match="too small"):
+            assign_degrees(hidden_dim=2, state_dim=5)
+
+    def test_assign_degrees_custom_range(self):
+        """Test custom degree range."""
+        degrees = assign_degrees(hidden_dim=10, state_dim=6, min_degree=1, max_degree=4)
+
+        assert degrees.min() == 1
+        assert degrees.max() == 4
+        assert len(np.unique(degrees)) == 4  # degrees 1,2,3,4
+
+    def test_create_hidden_mask_shape(self):
+        """Test hidden mask has correct shape."""
+        degrees_in = np.array([0, 0, 1, 1, 2, 2])
+        degrees_out = np.array([0, 1, 2, 3])
+
+        mask = create_hidden_mask(degrees_in, degrees_out)
+
+        assert mask.shape == (len(degrees_out), len(degrees_in))
+
+    def test_create_hidden_mask_autoregressive(self):
+        """Test mask enforces autoregressive property."""
+        degrees_in = np.array([0, 1, 2, 3])
+        degrees_out = np.array([0, 1, 2, 3])
+
+        mask = create_hidden_mask(degrees_in, degrees_out)
+
+        # Check lower triangular + diagonal structure
+        # mask[i,j] = 1 if degrees_in[j] <= degrees_out[i]
+        for i in range(len(degrees_out)):
+            for j in range(len(degrees_in)):
+                expected = 1.0 if degrees_in[j] <= degrees_out[i] else 0.0
+                assert mask[i, j].item() == expected
+
+    def test_create_hidden_mask_non_square(self):
+        """Test mask works for non-square matrices."""
+        degrees_in = np.array([0, 0, 1, 1])  # 4 units
+        degrees_out = np.array([0, 1, 2])     # 3 units
+
+        mask = create_hidden_mask(degrees_in, degrees_out)
+
+        assert mask.shape == (3, 4)
+        # Output 0 (degree 0) can see inputs with degree <= 0: [0,0]
+        assert mask[0].sum() == 2
+        # Output 1 (degree 1) can see inputs with degree <= 1: [0,0,1,1]
+        assert mask[1].sum() == 4
+        # Output 2 (degree 2) can see all inputs
+        assert mask[2].sum() == 4
+
+    def test_masked_residual_block(self):
+        """Test ResidualBlock with degree-based masking."""
+        hidden_dim = 16
+        state_dim = 4
+        hidden_degrees = assign_degrees(hidden_dim, state_dim)
+
+        block = ResidualBlock(
+            dim=hidden_dim,
+            context_dim=hidden_dim,
+            hidden_degrees=hidden_degrees
+        )
+
+        # Check that fc1 and fc2 are MaskedLinear
+        assert isinstance(block.fc1, MaskedLinear)
+        assert isinstance(block.fc2, MaskedLinear)
+
+        # Test forward pass
+        x = torch.randn(8, hidden_dim)
+        context = torch.randn(8, hidden_dim)
+        out = block(x, context)
+
+        assert out.shape == x.shape
+
+    def test_velocity_network_causal_structure_fixed(self):
+        """Test that VelocityNetwork now passes causal structure verification."""
+        state_dim = 6
+        hidden_dim = 24  # >= state_dim, required for MADE
+
+        net = VelocityNetwork(
+            state_dim=state_dim,
+            hidden_dim=hidden_dim,
+            n_regimes=2,
+            n_layers=2
+        )
+
+        # Verify causal structure
+        is_valid, violations = net.verify_causal_structure()
+
+        max_violation = violations.max().item()
+        print(f"Max violation: {max_violation:.2e}")
+
+        # Should now pass with much smaller violations
+        assert is_valid, f"Causal structure still violated! Max: {max_violation:.2e}"
+        assert max_violation < 1e-6, f"Violations too large: {max_violation:.2e}"
+
+    def test_velocity_network_degree_assignment(self):
+        """Test that VelocityNetwork properly assigns degrees."""
+        state_dim = 5
+        hidden_dim = 20
+
+        net = VelocityNetwork(
+            state_dim=state_dim,
+            hidden_dim=hidden_dim,
+            n_regimes=3
+        )
+
+        # Check hidden_degrees exists and is valid
+        assert hasattr(net, 'hidden_degrees')
+        assert len(net.hidden_degrees) == hidden_dim
+        assert net.hidden_degrees.min() == 0
+        assert net.hidden_degrees.max() == state_dim - 1
+
+    def test_velocity_network_various_sizes(self):
+        """Test causal structure holds for various network sizes."""
+        test_cases = [
+            (4, 16),   # small
+            (6, 24),   # medium
+            (10, 40),  # larger
+        ]
+
+        for state_dim, hidden_dim in test_cases:
+            net = VelocityNetwork(
+                state_dim=state_dim,
+                hidden_dim=hidden_dim,
+                n_regimes=2,
+                n_layers=2
+            )
+
+            is_valid, violations = net.verify_causal_structure()
+            max_violation = violations.max().item()
+
+            assert is_valid, (
+                f"Failed for state_dim={state_dim}, hidden_dim={hidden_dim}. "
+                f"Max violation: {max_violation:.2e}"
+            )
+
+    def test_velocity_network_custom_causal_order(self):
+        """Test causal structure with custom ordering."""
+        state_dim = 5
+        hidden_dim = 20
+        causal_order = np.array([2, 0, 4, 1, 3])  # custom permutation
+
+        net = VelocityNetwork(
+            state_dim=state_dim,
+            hidden_dim=hidden_dim,
+            n_regimes=2,
+            causal_order=causal_order
+        )
+
+        is_valid, violations = net.verify_causal_structure()
+
+        assert is_valid, f"Custom order failed! Max: {violations.max().item():.2e}"
+
+    def test_residual_block_unconstrained_fallback(self):
+        """Test ResidualBlock falls back to unconstrained when degrees not provided."""
+        block = ResidualBlock(
+            dim=16,
+            context_dim=16,
+            hidden_degrees=None  # No masking
+        )
+
+        # Should use nn.Linear instead of MaskedLinear
+        assert isinstance(block.fc1, nn.Linear)
+        assert isinstance(block.fc2, nn.Linear)
+        assert not isinstance(block.fc1, MaskedLinear)
+
+    def test_velocity_network_min_hidden_dim(self):
+        """Test that hidden_dim must be >= state_dim."""
+        state_dim = 10
+        hidden_dim = 5  # Too small
+
+        with pytest.raises(ValueError, match="too small"):
+            net = VelocityNetwork(
+                state_dim=state_dim,
+                hidden_dim=hidden_dim,
+                n_regimes=2
+            )
 
 
 if __name__ == "__main__":

@@ -206,6 +206,83 @@ class MaskedLinear(nn.Module):
                f'bias={self.bias is not None}, masked=True'
 
 
+def assign_degrees(
+    hidden_dim: int,
+    state_dim: int,
+    min_degree: int = 0,
+    max_degree: Optional[int] = None
+) -> np.ndarray:
+    """Assign degrees to hidden units for MADE masking.
+
+    Each hidden layer must contain all degrees to ensure full connectivity
+    (MADE requirement from Germain et al., 2015). Degrees determine which
+    state variables each hidden unit can "see" in the autoregressive ordering.
+
+    Args:
+        hidden_dim: Number of hidden units
+        state_dim: Dimension of state space
+        min_degree: Minimum degree (default 0)
+        max_degree: Maximum degree (default state_dim-1)
+
+    Returns:
+        degrees: Array of degrees for each hidden unit
+
+    Raises:
+        ValueError: If hidden_dim is too small to accommodate all degrees
+    """
+    if max_degree is None:
+        max_degree = state_dim - 1
+
+    num_degrees = max_degree - min_degree + 1
+
+    # Ensure we have at least one unit per degree
+    if hidden_dim < num_degrees:
+        raise ValueError(
+            f"Hidden dim {hidden_dim} too small for state dim {state_dim}. "
+            f"Need at least {num_degrees} hidden units to represent all degrees "
+            f"[{min_degree}, {max_degree}]."
+        )
+
+    # Distribute degrees evenly across hidden units
+    # This ensures each degree appears at least once (MADE requirement)
+    degrees = np.zeros(hidden_dim, dtype=np.int32)
+    for i in range(hidden_dim):
+        degrees[i] = min_degree + (i % num_degrees)
+
+    return degrees
+
+
+def create_hidden_mask(
+    degrees_in: np.ndarray,
+    degrees_out: np.ndarray
+) -> torch.Tensor:
+    """Create mask for hidden-to-hidden connections in MADE architecture.
+
+    Implements the autoregressive constraint: a hidden unit can only receive
+    information from units with equal or lower degree. This ensures that
+    the Jacobian remains lower-triangular throughout the network.
+
+    Mask[i,j] = 1 if degree_in[j] <= degree_out[i] (unit j can influence unit i)
+
+    Args:
+        degrees_in: Degrees of input units (which variables they can see)
+        degrees_out: Degrees of output units
+
+    Returns:
+        mask: Binary mask of shape (len(degrees_out), len(degrees_in))
+              where mask[i,j]=1 allows connection from input j to output i
+    """
+    degrees_in = torch.tensor(degrees_in, dtype=torch.long)
+    degrees_out = torch.tensor(degrees_out, dtype=torch.long)
+
+    # Broadcast to create mask
+    # mask[i,j] = 1 if degrees_in[j] <= degrees_out[i]
+    # This allows lower-degree (upstream) units to influence higher-degree units
+    mask = (degrees_in.unsqueeze(0) <= degrees_out.unsqueeze(1)).float()
+
+    return mask
+
+
 def create_causal_mask(
     dim: int,
     causal_order: Optional[np.ndarray] = None,
@@ -250,16 +327,22 @@ def create_causal_mask(
 
 
 class ResidualBlock(nn.Module):
-    """Residual block with FiLM conditioning.
+    """Residual block with FiLM conditioning and optional causal masking.
 
     Implements: output = x + MLP(FiLM(x, context))
 
     Uses SiLU (Swish) activation which is smooth and avoids dead neurons
     that can occur with ReLU during ODE integration.
 
+    For MADE-compliant causal masking, pass hidden_degrees to enforce
+    autoregressive constraints in the MLP layers.
+
     Args:
         dim: Hidden dimension
         context_dim: Dimension of FiLM conditioning context
+        hidden_degrees: Optional degree assignment for hidden units (for MADE).
+                       If provided, fc1 and fc2 will use MaskedLinear layers.
+        expansion_factor: Expansion factor for MLP (default 4)
         dropout: Dropout probability (default 0.0)
     """
 
@@ -267,20 +350,43 @@ class ResidualBlock(nn.Module):
         self,
         dim: int,
         context_dim: int,
+        hidden_degrees: Optional[np.ndarray] = None,
+        expansion_factor: int = 4,
         dropout: float = 0.0
     ):
         super().__init__()
         self.dim = dim
+        self.expansion_factor = expansion_factor
+        expanded_dim = dim * expansion_factor
 
-        # Pre-norm architecture
-        self.norm = nn.LayerNorm(dim)
-
-        # Two-layer MLP
-        self.fc1 = nn.Linear(dim, dim * 4)
-        self.fc2 = nn.Linear(dim * 4, dim)
+        # NOTE: We do NOT use LayerNorm here for MADE-compliant networks because
+        # LayerNorm mixes information across all hidden units, violating the
+        # autoregressive property required for causal structure.
 
         # FiLM conditioning
         self.film = FiLMLayer(dim, context_dim)
+
+        # Two-layer MLP with optional masking
+        if hidden_degrees is not None:
+            # Assign degrees to expanded hidden layer
+            # The expanded layer gets a finer degree distribution
+            expanded_degrees = assign_degrees(
+                expanded_dim,
+                len(np.unique(hidden_degrees)),
+                min_degree=hidden_degrees.min(),
+                max_degree=hidden_degrees.max()
+            )
+
+            # Create masks for fc1 (dim -> expanded_dim) and fc2 (expanded_dim -> dim)
+            mask_fc1 = create_hidden_mask(hidden_degrees, expanded_degrees)
+            mask_fc2 = create_hidden_mask(expanded_degrees, hidden_degrees)
+
+            self.fc1 = MaskedLinear(dim, expanded_dim, mask=mask_fc1)
+            self.fc2 = MaskedLinear(expanded_dim, dim, mask=mask_fc2)
+        else:
+            # Fallback: fully connected (for unconstrained network)
+            self.fc1 = nn.Linear(dim, expanded_dim)
+            self.fc2 = nn.Linear(expanded_dim, dim)
 
         # Dropout for regularization
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -302,11 +408,8 @@ class ResidualBlock(nn.Module):
         Returns:
             output: Residual output of shape (batch, dim)
         """
-        # Pre-norm
-        h = self.norm(x)
-
-        # FiLM modulation
-        h = self.film(h, context)
+        # FiLM modulation (no LayerNorm to preserve causal structure)
+        h = self.film(x, context)
 
         # MLP
         h = self.fc1(h)
@@ -373,15 +476,19 @@ class VelocityNetwork(nn.Module):
         self.n_regimes = n_regimes
         self.n_layers = n_layers
 
-        # Create causal mask
+        # Create causal mask and degree assignments
         if causal_order is not None:
             self.causal_order = np.array(causal_order)
         else:
             self.causal_order = np.arange(state_dim)
 
-        # Input/output masks (same mask for autoregressive property)
+        # Store causal mask for verification
         mask = create_causal_mask(state_dim, self.causal_order)
         self.register_buffer('causal_mask', mask)
+
+        # Assign degrees to hidden units (MADE requirement)
+        # Each hidden unit is assigned a degree indicating which state variables it can see
+        self.hidden_degrees = assign_degrees(hidden_dim, state_dim)
 
         # Time embedding
         self.time_embed = SinusoidalTimeEmbedding(time_embed_dim)
@@ -399,60 +506,47 @@ class VelocityNetwork(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
 
+        # Input projection mask: state variables -> hidden units
+        # State variable i has degree = causal_order[i]
+        # Hidden unit j can only see state variables with degree <= hidden_degrees[j]
+        input_mask = create_hidden_mask(self.causal_order, self.hidden_degrees)
+
         # Input projection (masked)
         self.input_proj = MaskedLinear(
             state_dim, hidden_dim,
-            mask=self._expand_mask(mask, hidden_dim, state_dim)
+            mask=input_mask
         )
 
-        # Residual blocks
+        # Residual blocks with masked connections
         self.blocks = nn.ModuleList([
-            ResidualBlock(hidden_dim, hidden_dim, dropout)
+            ResidualBlock(
+                hidden_dim,
+                hidden_dim,
+                hidden_degrees=self.hidden_degrees,  # Enable MADE masking
+                dropout=dropout
+            )
             for _ in range(n_layers)
         ])
+
+        # Output projection mask: hidden units -> state variables
+        # Transpose of input logic: state variable i can only be influenced by
+        # hidden units with degree <= causal_order[i]
+        output_mask = create_hidden_mask(self.hidden_degrees, self.causal_order)
 
         # Output projection (masked)
         self.output_proj = MaskedLinear(
             hidden_dim, state_dim,
-            mask=self._expand_mask(mask.T, state_dim, hidden_dim)
+            mask=output_mask
         )
 
-        # Final layer norm
-        self.output_norm = nn.LayerNorm(hidden_dim)
+        # NOTE: We do NOT use LayerNorm before output projection because it would
+        # mix information across degrees, violating the causal structure.
+        # LayerNorm normalizes across the entire hidden dimension, creating
+        # dependencies between all hidden units, which breaks MADE's autoregressive property.
 
         # Initialize output projection to small values for stable training
         nn.init.zeros_(self.output_proj.bias)
         nn.init.normal_(self.output_proj.weight, std=0.02)
-
-    def _expand_mask(
-        self,
-        mask: torch.Tensor,
-        out_dim: int,
-        in_dim: int
-    ) -> torch.Tensor:
-        """Expand state-space mask to hidden dimensions.
-
-        For input projection: repeat mask rows for hidden neurons
-        For output projection: repeat mask columns for hidden neurons
-        """
-        state_out, state_in = mask.shape
-
-        if out_dim == state_out and in_dim == self.hidden_dim:
-            # Output projection: (state_dim, hidden_dim)
-            # Each state variable can only be influenced by causally-upstream hidden units
-            # Approximate by using the mask structure
-            expanded = mask.unsqueeze(-1).expand(state_out, state_in, in_dim // state_in + 1)
-            expanded = expanded.reshape(state_out, -1)[:, :in_dim]
-        elif out_dim == self.hidden_dim and in_dim == state_in:
-            # Input projection: (hidden_dim, state_dim)
-            # Each hidden unit group receives from corresponding state variables
-            expanded = mask.unsqueeze(0).expand(out_dim // state_out + 1, state_out, state_in)
-            expanded = expanded.reshape(-1, state_in)[:out_dim, :]
-        else:
-            # Fallback: fully connected
-            expanded = torch.ones(out_dim, in_dim)
-
-        return expanded
 
     def forward(
         self,
@@ -494,8 +588,7 @@ class VelocityNetwork(nn.Module):
         for block in self.blocks:
             h = block(h, context)
 
-        # Output projection
-        h = self.output_norm(h)
+        # Output projection (no LayerNorm to preserve causal structure)
         v = self.output_proj(h)  # (batch, state_dim)
 
         return v

@@ -7,7 +7,8 @@
       "Bash(dir:*)",
       "Bash(python -c:*)",
       "Bash(python tests/test_etl.py:*)",
-      "Bash(python test_non_gaussianity.py:*)"
+      "Bash(python test_non_gaussianity.py:*)",
+      "Bash(cat:*)"
     ]
   }
 }

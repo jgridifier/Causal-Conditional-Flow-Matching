@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from core import CausalFlowMatcher
-from examples.data_fetcher import create_sample_dataset
+from examples.data_fetcher import fetch_all_data
 
 
 def main():
@@ -40,11 +40,9 @@ def main():
 
     # Use synthetic data (works without API keys)
     # For real data, use: fetch_all_data() from data_fetcher.py
-    X, fast_vars, slow_vars = create_sample_dataset()
+    X  = fetch_all_data()
 
     print(f"  Data shape: {X.shape}")
-    print(f"  Fast (market) variables: {len(fast_vars)}")
-    print(f"  Slow (macro) variables: {len(slow_vars)}")
 
     # =========================================================================
     # Step 2: Initialize C-CFM
@@ -65,10 +63,8 @@ def main():
     # =========================================================================
     print("\n[3/5] Fitting preprocessing pipeline...")
 
-    cfm.fit(
-        X,
-        fast_vars=fast_vars,
-        slow_vars=slow_vars
+    cfm.fit(  # Fully automatic causal discovery
+        X.drop("date")
     )
 
     print(f"  Number of regimes detected: {cfm.n_regimes}")
@@ -103,7 +99,7 @@ def main():
 
     # Stress scenario: VIX shock
     print("\n  Generating VIX shock scenario (3 std)...")
-    vix_idx = fast_vars.index('VIX') if 'VIX' in fast_vars else 0
+    vix_idx = cfm.variable_names.index('VIX') if 'VIX' in cfm.variable_names else 0
     stressed = cfm.shock(
         variable=vix_idx,
         magnitude=3.0,      # 3 standard deviations
@@ -145,8 +141,8 @@ def main():
     # =========================================================================
     # Save Model (optional)
     # =========================================================================
-    # cfm.save('my_model.pt')
-    # print("\nModel saved to my_model.pt")
+    cfm.save('D:\DEV\Causal-Conditional-Flow-Matching\examples\my_model.pt')
+    print("\nModel saved to my_model.pt")
 
     print("\n" + "=" * 60)
     print("Quick start complete!")
@@ -156,4 +152,7 @@ def main():
 
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()  # Load environment variables from .env file
+
     cfm, baseline, stressed = main()

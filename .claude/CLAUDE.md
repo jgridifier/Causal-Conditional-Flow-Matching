@@ -1,0 +1,1 @@
+Avoid using pandas when possible, use polars or numpy instead. For plotting and graphing, use vega-altair over matplotlib.
