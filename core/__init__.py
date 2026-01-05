@@ -77,7 +77,8 @@ from .solver import (
     SolverConfig,
     ScenarioGenerator,
     VelocityFieldWrapper,
-    GuidedVelocityField
+    GuidedVelocityField,
+    TemporalGuidedVelocityField
 )
 
 
@@ -121,6 +122,7 @@ __all__ = [
     "ScenarioGenerator",
     "VelocityFieldWrapper",
     "GuidedVelocityField",
+    "TemporalGuidedVelocityField",
 ]
 
 
@@ -446,63 +448,224 @@ class CausalFlowMatcher:
             shocks, n_samples, regime, guidance_strength, denormalize
         )
 
-    def generate_paths(
+    def forecast(
         self,
         n_paths: int = 100,
-        n_steps: int = 48,
+        n_steps: int = 36,
         regime: int = 0,
+        noise_scale: float = 0.1,
+        initial_state: Optional[np.ndarray] = None,
         denormalize: bool = True
     ) -> np.ndarray:
-        """Generate multi-step forward-looking paths (trajectories).
+        """Generate temporal forecasting paths with autoregressive conditioning.
 
-        This method creates multiple scenario paths by repeatedly sampling
-        from the model. Each path represents a possible future trajectory
-        of all variables over multiple time steps.
+        This method generates multi-step forward projections where each step
+        is conditioned on the previous state, creating temporally coherent
+        forecasting paths. This is the proper temporal forecasting approach
+        that maintains dependencies between time steps.
 
-        Note: The current implementation generates independent samples at
-        each step. For applications requiring temporal dependencies, consider
-        implementing an autoregressive variant that conditions on previous steps.
+        Unlike generate_paths() which generates independent samples at each step,
+        this method creates autoregressive paths where:
+        1. An initial state is sampled (or provided)
+        2. Each subsequent step uses the previous state as conditioning
+        3. Innovation noise controls diversity across paths
 
         Args:
-            n_paths: Number of different scenario paths to generate
-            n_steps: Number of time steps to project forward
-            regime: Regime label for generation
-            denormalize: Whether to return in original scale
+            n_paths: Number of scenario paths to generate
+            n_steps: Number of time steps to forecast forward
+            regime: Regime label for generation (or list of regimes per step)
+            noise_scale: Scale of innovation noise between steps (default 0.1).
+                        Higher values = more diversity between steps.
+                        Lower values = smoother, more persistent paths.
+            initial_state: Optional initial state of shape (n_paths, n_vars) in
+                          ORIGINAL scale. If None, samples from learned distribution.
+            denormalize: Whether to return paths in original scale
 
         Returns:
             paths: Array of shape (n_paths, n_steps, n_variables)
-                  containing the generated trajectories
 
         Example:
-            >>> cfm = CausalFlowMatcher()
-            >>> cfm.fit(X)
-            >>> cfm.train(n_epochs=500)
-            >>> # Generate 50 paths with 48 time steps each
-            >>> paths = cfm.generate_paths(n_paths=50, n_steps=48)
-            >>> # paths.shape -> (50, 48, n_variables)
+            >>> cfm = CausalFlowMatcher.load('model.pt')
+            >>> # Generate 100 paths, 36 months forward (3 years)
+            >>> paths = cfm.forecast(n_paths=100, n_steps=36)
+            >>> # paths.shape -> (100, 36, n_variables)
+            >>>
+            >>> # With custom initial state (e.g., current market conditions)
+            >>> current_state = get_current_market_data()  # (1, n_vars) or (n_paths, n_vars)
+            >>> paths = cfm.forecast(n_paths=100, n_steps=36, initial_state=current_state)
         """
         if not self._is_trained:
-            raise RuntimeError("Must call train() before generate_paths()")
+            raise RuntimeError("Must call train() before forecast()")
 
-        n_vars = len(self.variable_names)
-        paths = np.empty((n_paths, n_steps, n_vars), dtype=np.float64)
+        # Handle initial state
+        initial_tensor = None
+        if initial_state is not None:
+            initial_np = np.atleast_2d(initial_state)
+            # Normalize the initial state
+            normalized = (initial_np - self.topology.scaler_mean) / self.topology.scaler_std
+            # Reorder to causal order
+            normalized = normalized[:, self.topology.causal_order]
+            # Broadcast if single state provided
+            if normalized.shape[0] == 1 and n_paths > 1:
+                normalized = np.tile(normalized, (n_paths, 1))
+            initial_tensor = torch.from_numpy(normalized).float()
 
-        # Generate all samples for all steps at once (much faster)
-        # Shape: (n_paths * n_steps, n_vars)
-        all_samples = self.generator.baseline(
-            n_scenarios=n_paths * n_steps,
+        # Generate paths using solver
+        paths_tensor = self.solver.forecast_paths(
+            n_paths=n_paths,
+            n_steps=n_steps,
             regime=regime,
-            denormalize=denormalize
+            noise_scale=noise_scale,
+            constraint_trajectories=None,
+            guidance_strength=1.0,
+            initial_state=initial_tensor
         )
 
-        # Reshape into paths
-        # Convert from (n_paths * n_steps, n_vars) to (n_paths, n_steps, n_vars)
-        all_samples_reshaped = all_samples.reshape(n_paths, n_steps, n_vars)
+        paths_np = paths_tensor.cpu().numpy()
 
-        # Use explicit copy to avoid numpy 2.0 warnings
-        np.copyto(paths, all_samples_reshaped)
+        if denormalize:
+            # Denormalize each step
+            n_vars = paths_np.shape[2]
+            paths_denorm = np.empty_like(paths_np)
+            inverse_order = np.argsort(self.topology.causal_order)
 
-        return paths
+            for step in range(n_steps):
+                step_data = paths_np[:, step, :]
+                # Reverse causal ordering
+                step_reordered = step_data[:, inverse_order]
+                # Denormalize
+                step_denorm = step_reordered * self.topology.scaler_std + self.topology.scaler_mean
+                paths_denorm[:, step, :] = step_denorm
+
+            return paths_denorm
+
+        return paths_np
+
+    def forecast_with_constraints(
+        self,
+        n_paths: int = 100,
+        n_steps: int = 36,
+        constraint_paths: Optional[Dict[str, np.ndarray]] = None,
+        regime: int = 0,
+        noise_scale: float = 0.1,
+        guidance_strength: float = 1.0,
+        initial_state: Optional[np.ndarray] = None,
+        denormalize: bool = True
+    ) -> np.ndarray:
+        """Generate temporal forecasting paths with predefined variable constraints.
+
+        This is the constrained temporal forecasting method that allows you to
+        specify predetermined paths for one or more variables. The model will
+        generate forecasts for all other variables while respecting the
+        constraint trajectories via soft manifold guidance.
+
+        This is useful for:
+        - Scenario analysis: "What if interest rates follow this path?"
+        - Stress testing: "What if VIX rises to 40 over the next year?"
+        - Conditional forecasting: "Given this Fed policy path, forecast equities"
+
+        Args:
+            n_paths: Number of scenario paths to generate
+            n_steps: Number of time steps to forecast forward
+            constraint_paths: Dict mapping variable names to arrays of shape (n_steps,)
+                            containing the target trajectory in ORIGINAL scale.
+                            Example: {'DFF': np.array([5.0, 5.25, 5.5, ...])}
+            regime: Regime label for generation
+            noise_scale: Scale of innovation noise between steps
+            guidance_strength: How strongly to enforce constraints (default 1.0).
+                              Higher = stricter adherence to constraint paths.
+            initial_state: Optional initial state (n_paths, n_vars) in original scale
+            denormalize: Whether to return paths in original scale
+
+        Returns:
+            paths: Array of shape (n_paths, n_steps, n_variables)
+
+        Example:
+            >>> cfm = CausalFlowMatcher.load('model.pt')
+            >>>
+            >>> # Scenario: Fed raises rates over next 12 months
+            >>> rate_path = np.linspace(5.0, 6.0, 12)  # Fed funds rate
+            >>> paths = cfm.forecast_with_constraints(
+            ...     n_paths=100,
+            ...     n_steps=12,
+            ...     constraint_paths={'DFF': rate_path}
+            ... )
+            >>>
+            >>> # Multiple constraints: Rates up, VIX spikes
+            >>> vix_path = np.concatenate([np.linspace(15, 35, 6), np.linspace(35, 20, 6)])
+            >>> paths = cfm.forecast_with_constraints(
+            ...     n_paths=100,
+            ...     n_steps=12,
+            ...     constraint_paths={'DFF': rate_path, 'VIX': vix_path}
+            ... )
+        """
+        if not self._is_trained:
+            raise RuntimeError("Must call train() before forecast_with_constraints()")
+
+        # Convert constraint paths to normalized space with variable indices
+        constraint_trajectories = None
+        if constraint_paths:
+            constraint_trajectories = {}
+            for var_name, trajectory in constraint_paths.items():
+                if var_name not in self.variable_names:
+                    raise ValueError(f"Unknown variable: {var_name}. Available: {self.variable_names}")
+
+                # Get variable index in causal order
+                var_idx = self.variable_names.index(var_name)
+
+                # Get original variable index for normalization params
+                orig_idx = self.topology.causal_order[var_idx]
+
+                # Normalize the trajectory
+                mean = self.topology.scaler_mean[orig_idx]
+                std = self.topology.scaler_std[orig_idx]
+                normalized_trajectory = (np.asarray(trajectory) - mean) / std
+
+                constraint_trajectories[var_idx] = normalized_trajectory
+
+        # Handle initial state
+        initial_tensor = None
+        if initial_state is not None:
+            initial_np = np.atleast_2d(initial_state)
+            # Normalize the initial state
+            normalized = (initial_np - self.topology.scaler_mean) / self.topology.scaler_std
+            # Reorder to causal order
+            normalized = normalized[:, self.topology.causal_order]
+            # Broadcast if single state provided
+            if normalized.shape[0] == 1 and n_paths > 1:
+                normalized = np.tile(normalized, (n_paths, 1))
+            initial_tensor = torch.from_numpy(normalized).float()
+
+        # Generate constrained paths
+        paths_tensor = self.solver.forecast_paths(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            regime=regime,
+            noise_scale=noise_scale,
+            constraint_trajectories=constraint_trajectories,
+            guidance_strength=guidance_strength,
+            initial_state=initial_tensor
+        )
+
+        paths_np = paths_tensor.cpu().numpy()
+
+        if denormalize:
+            # Denormalize each step
+            n_vars = paths_np.shape[2]
+            paths_denorm = np.empty_like(paths_np)
+            inverse_order = np.argsort(self.topology.causal_order)
+
+            for step in range(n_steps):
+                step_data = paths_np[:, step, :]
+                # Reverse causal ordering
+                step_reordered = step_data[:, inverse_order]
+                # Denormalize
+                step_denorm = step_reordered * self.topology.scaler_std + self.topology.scaler_mean
+                paths_denorm[:, step, :] = step_denorm
+
+            return paths_denorm
+
+        return paths_np
 
     def save(self, path: Union[str, Path]) -> None:
         """Save the complete model to disk.

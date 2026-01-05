@@ -124,6 +124,41 @@ def main():
     print(f"    Shape: {multi.shape}")
 
     # =========================================================================
+    # Step 6: Temporal Forecasting
+    # =========================================================================
+    print("\n[6/6] Temporal Forecasting...")
+
+    # Generate autoregressive temporal forecasts (3 years forward)
+    print("\n  Generating temporal forecast paths (36 months forward)...")
+    forecast_paths = cfm.forecast(
+        n_paths=50,       # 50 scenario paths
+        n_steps=36,       # 36 months = 3 years
+        regime=0,
+        noise_scale=0.1   # Innovation noise between steps
+    )
+    print(f"    Shape: {forecast_paths.shape}")
+    print(f"    This maintains temporal dependencies between time steps")
+
+    # Constrained forecasting example
+    print("\n  Generating constrained forecast (with predetermined path)...")
+    # Create a simple constraint: first variable follows a rising path
+    constraint_path = np.linspace(
+        baseline[:, 0].mean(),  # Start at current mean
+        baseline[:, 0].mean() + 2 * baseline[:, 0].std(),  # Rise by 2 std
+        36  # Over 36 steps
+    )
+
+    constrained_forecast = cfm.forecast_with_constraints(
+        n_paths=50,
+        n_steps=36,
+        constraint_paths={var_names[0]: constraint_path},
+        regime=0,
+        guidance_strength=1.0
+    )
+    print(f"    Constrained shape: {constrained_forecast.shape}")
+    print(f"    Variable '{var_names[0]}' follows predetermined path")
+
+    # =========================================================================
     # Summary Statistics
     # =========================================================================
     print("\n" + "=" * 60)
@@ -138,21 +173,27 @@ def main():
     for i, var in enumerate(cfm.variable_names[:5]):
         print(f"  {var}: mean={stressed[:, i].mean():.3f}, std={stressed[:, i].std():.3f}")
 
+    print("\nTemporal Forecast Statistics (first 5 vars, step 0 vs step 35):")
+    for i, var in enumerate(cfm.variable_names[:5]):
+        print(f"  {var}: t=0 mean={forecast_paths[:, 0, i].mean():.3f}, "
+              f"t=35 mean={forecast_paths[:, -1, i].mean():.3f}")
+
     # =========================================================================
     # Save Model (optional)
     # =========================================================================
-    cfm.save('D:\DEV\Causal-Conditional-Flow-Matching\examples\my_model.pt')
-    print("\nModel saved to my_model.pt")
+    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'my_model.pt')
+    cfm.save(model_path)
+    print(f"\nModel saved to {model_path}")
 
     print("\n" + "=" * 60)
     print("Quick start complete!")
     print("=" * 60)
 
-    return cfm, baseline, stressed
+    return cfm, baseline, stressed, forecast_paths
 
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()  # Load environment variables from .env file
 
-    cfm, baseline, stressed = main()
+    cfm, baseline, stressed, forecast_paths = main()
