@@ -448,64 +448,6 @@ class CausalFlowMatcher:
             shocks, n_samples, regime, guidance_strength, denormalize
         )
 
-    def generate_paths(
-        self,
-        n_paths: int = 100,
-        n_steps: int = 48,
-        regime: int = 0,
-        denormalize: bool = True
-    ) -> np.ndarray:
-        """Generate multi-step forward-looking paths (trajectories).
-
-        This method creates multiple scenario paths by repeatedly sampling
-        from the model. Each path represents a possible future trajectory
-        of all variables over multiple time steps.
-
-        Note: The current implementation generates independent samples at
-        each step. For applications requiring temporal dependencies, consider
-        implementing an autoregressive variant that conditions on previous steps.
-
-        Args:
-            n_paths: Number of different scenario paths to generate
-            n_steps: Number of time steps to project forward
-            regime: Regime label for generation
-            denormalize: Whether to return in original scale
-
-        Returns:
-            paths: Array of shape (n_paths, n_steps, n_variables)
-                  containing the generated trajectories
-
-        Example:
-            >>> cfm = CausalFlowMatcher()
-            >>> cfm.fit(X)
-            >>> cfm.train(n_epochs=500)
-            >>> # Generate 50 paths with 48 time steps each
-            >>> paths = cfm.generate_paths(n_paths=50, n_steps=48)
-            >>> # paths.shape -> (50, 48, n_variables)
-        """
-        if not self._is_trained:
-            raise RuntimeError("Must call train() before generate_paths()")
-
-        n_vars = len(self.variable_names)
-        paths = np.empty((n_paths, n_steps, n_vars), dtype=np.float64)
-
-        # Generate all samples for all steps at once (much faster)
-        # Shape: (n_paths * n_steps, n_vars)
-        all_samples = self.generator.baseline(
-            n_scenarios=n_paths * n_steps,
-            regime=regime,
-            denormalize=denormalize
-        )
-
-        # Reshape into paths
-        # Convert from (n_paths * n_steps, n_vars) to (n_paths, n_steps, n_vars)
-        all_samples_reshaped = all_samples.reshape(n_paths, n_steps, n_vars)
-
-        # Use explicit copy to avoid numpy 2.0 warnings
-        np.copyto(paths, all_samples_reshaped)
-
-        return paths
-
     def forecast(
         self,
         n_paths: int = 100,

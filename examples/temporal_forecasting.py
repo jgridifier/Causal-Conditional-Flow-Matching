@@ -71,7 +71,7 @@ def main():
     n_steps = 36   # 36 months = 3 years forward
 
     # Generate autoregressive forecasting paths
-    # Unlike generate_paths(), this maintains temporal dependencies
+    # This maintains temporal dependencies between consecutive steps
     forecast_paths = cfm.forecast(
         n_paths=n_paths,
         n_steps=n_steps,
@@ -81,15 +81,6 @@ def main():
 
     print(f"  Generated {n_paths} paths with {n_steps} time steps")
     print(f"  Shape: {forecast_paths.shape}")
-
-    # Compare with independent sampling (old method)
-    independent_paths = cfm.generate_paths(
-        n_paths=n_paths,
-        n_steps=n_steps,
-        regime=0
-    )
-
-    print(f"  For comparison: independent paths shape: {independent_paths.shape}")
 
     # =========================================================================
     # Step 3: Constrained Forecasting
@@ -157,18 +148,17 @@ def main():
                     autocorrs.append(corr)
         return np.mean(autocorrs) if autocorrs else 0.0
 
-    print("\n  Lag-1 Autocorrelation Comparison:")
-    print("  " + "-" * 50)
-    print(f"  {'Variable':<20} {'Forecast':<15} {'Independent':<15}")
-    print("  " + "-" * 50)
+    print("\n  Lag-1 Autocorrelation (Temporal Coherence):")
+    print("  " + "-" * 40)
+    print(f"  {'Variable':<20} {'Autocorrelation':<15}")
+    print("  " + "-" * 40)
 
     for i, var in enumerate(cfm.variable_names[:5]):
         forecast_ac = compute_path_autocorr(forecast_paths, i)
-        independent_ac = compute_path_autocorr(independent_paths, i)
-        print(f"  {var:<20} {forecast_ac:>+.3f}          {independent_ac:>+.3f}")
+        print(f"  {var:<20} {forecast_ac:>+.3f}")
 
-    print("  " + "-" * 50)
-    print("  (Higher autocorrelation = more temporal coherence)")
+    print("  " + "-" * 40)
+    print("  (Positive autocorrelation = temporal coherence)")
 
     # =========================================================================
     # Step 5: Visualization
@@ -194,34 +184,28 @@ def main():
     # Select a few variables for visualization
     viz_vars = cfm.variable_names[:4]
 
-    # Create comparison dataframe (temporal vs independent)
+    # Create forecast paths dataframe
     forecast_df = paths_to_dataframe(forecast_paths, cfm.variable_names, 'Temporal Forecast')
-    independent_df = paths_to_dataframe(independent_paths, cfm.variable_names, 'Independent Samples')
-
-    # Filter to visualization variables
     forecast_df = forecast_df[forecast_df['variable'].isin(viz_vars)]
-    independent_df = independent_df[independent_df['variable'].isin(viz_vars)]
 
-    comparison_df = pd.concat([forecast_df, independent_df])
-
-    # Create path comparison chart
-    comparison_chart = alt.Chart(comparison_df).mark_line(opacity=0.15, size=0.5).encode(
+    # Create path visualization chart
+    paths_chart = alt.Chart(forecast_df).mark_line(opacity=0.15, size=0.5).encode(
         x=alt.X('step:Q', title='Time Step (months)'),
         y=alt.Y('value:Q', title='Value'),
-        color=alt.Color('type:N', title='Method'),
+        color=alt.value('steelblue'),
         detail='path_id:N'
     ).properties(
         width=300,
         height=150
     ).facet(
         column=alt.Column('variable:N', title=None, header=alt.Header(labelAngle=0)),
-        row=alt.Row('type:N', title=None)
+        columns=4
     ).resolve_scale(
         y='independent'
     )
 
-    comparison_chart.save('temporal_forecast_comparison.html')
-    print("  Saved: temporal_forecast_comparison.html")
+    paths_chart.save('temporal_forecast_paths.html')
+    print("  Saved: temporal_forecast_paths.html")
 
     # Create percentile band chart for temporal forecast
     percentile_data = []
@@ -361,16 +345,16 @@ Temporal Forecasting Results:
 - Variables: {len(cfm.variable_names)}
 - Method: Autoregressive conditioning with noise_scale=0.1
 
-Key Differences from Independent Sampling:
-- forecast(): Temporal dependencies preserved (higher autocorrelation)
-- generate_paths(): Independent samples at each step
+Key Features:
+- forecast(): Uses autoregressive conditioning for temporal coherence
+- forecast_with_constraints(): Enforces predetermined paths for specific variables
 
 Constrained Forecasting:
 - Variables with constraints: {list(constraint_paths_dict.keys()) if constraint_paths_dict else 'None'}
 - Guidance enforces predetermined paths while allowing other variables to respond
 
 Files Created:
-1. temporal_forecast_comparison.html - Side-by-side comparison
+1. temporal_forecast_paths.html - Individual forecast paths
 2. temporal_forecast_bands.html - Confidence bands for temporal forecast
 3. temporal_forecast_constrained.html - Constrained forecast visualization
 """)

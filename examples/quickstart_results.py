@@ -58,11 +58,6 @@ temporal_paths = cfm.forecast(
 print(f"  Generated {n_paths} temporal paths with {n_steps} steps each")
 print(f"  Shape: {temporal_paths.shape}")
 
-# OLD: Generate independent paths for comparison
-print("\n[2/4] Generating independent paths for comparison...")
-independent_paths = cfm.generate_paths(n_paths=n_paths, n_steps=n_steps, regime=0)
-print(f"  Generated {n_paths} independent paths with {n_steps} steps each")
-
 # Use temporal_paths as the primary visualization
 paths = temporal_paths
 
@@ -269,11 +264,11 @@ band_chart.save('quickstart_results_bands.html')
 print("  Saved: quickstart_results_bands.html")
 
 # ========================================
-# Create Temporal vs Independent Comparison
+# Create Temporal Coherence Analysis
 # ========================================
-print("\nCreating temporal vs independent comparison...")
+print("\nAnalyzing temporal coherence...")
 
-# Compute lag-1 autocorrelation for comparison
+# Compute lag-1 autocorrelation to verify temporal dependencies
 def compute_autocorr(paths_arr, var_idx, lag=1):
     """Compute average autocorrelation across paths."""
     autocorrs = []
@@ -285,34 +280,25 @@ def compute_autocorr(paths_arr, var_idx, lag=1):
                 autocorrs.append(corr)
     return np.mean(autocorrs) if autocorrs else 0.0
 
-# Create comparison data
-comparison_data = []
+# Create autocorrelation data
+autocorr_data = []
 for var_idx, var_name in enumerate(cfm.variable_names[:6]):
     temporal_ac = compute_autocorr(temporal_paths, var_idx)
-    independent_ac = compute_autocorr(independent_paths, var_idx)
-    comparison_data.append({
+    autocorr_data.append({
         'variable': var_name,
-        'method': 'Temporal Forecast',
         'autocorrelation': temporal_ac
     })
-    comparison_data.append({
-        'variable': var_name,
-        'method': 'Independent Samples',
-        'autocorrelation': independent_ac
-    })
 
-comparison_df_ac = pd.DataFrame(comparison_data)
+autocorr_df = pd.DataFrame(autocorr_data)
 
-# Create autocorrelation comparison chart
-autocorr_chart = alt.Chart(comparison_df_ac).mark_bar().encode(
-    x=alt.X('method:N', title=None),
-    y=alt.Y('autocorrelation:Q', title='Lag-1 Autocorrelation'),
-    color=alt.Color('method:N', title='Method'),
-    column=alt.Column('variable:N', header=alt.Header(labelAngle=0))
+# Create autocorrelation chart
+autocorr_chart = alt.Chart(autocorr_df).mark_bar(color='steelblue').encode(
+    x=alt.X('variable:N', title='Variable'),
+    y=alt.Y('autocorrelation:Q', title='Lag-1 Autocorrelation')
 ).properties(
-    width=100,
-    height=200,
-    title='Temporal Coherence: Temporal Forecast vs Independent Samples'
+    width=400,
+    height=250,
+    title='Temporal Coherence: Lag-1 Autocorrelation of Forecast Paths'
 )
 
 autocorr_chart.save('quickstart_results_autocorr.html')
@@ -374,19 +360,18 @@ print("=" * 60)
 print(f"""
 Generated Forecasts:
 - Temporal Forecast: {n_paths} paths x {n_steps} steps (autoregressive)
-- Independent Paths: {n_paths} paths x {n_steps} steps (for comparison)
 - Constrained Forecast: {constraint_var if constraint_var else 'N/A'}
 - Variables: {len(cfm.variable_names)}
 
-Key Insight:
-  Temporal forecast maintains higher autocorrelation (temporal coherence)
-  compared to independent sampling at each step.
+Key Feature:
+  Temporal forecast uses autoregressive conditioning to maintain
+  temporal coherence between consecutive time steps.
 
 Visualizations Created:
-  1. quickstart_results_boxplot.html   - Distribution comparison
-  2. quickstart_results_paths.html     - All individual paths
-  3. quickstart_results_bands.html     - Percentile bands over time
-  4. quickstart_results_autocorr.html  - Temporal vs Independent comparison
+  1. quickstart_results_boxplot.html    - Distribution comparison
+  2. quickstart_results_paths.html      - All individual paths
+  3. quickstart_results_bands.html      - Percentile bands over time
+  4. quickstart_results_autocorr.html   - Temporal coherence analysis
   5. quickstart_results_constrained.html - Constrained forecast (if applicable)
 """)
 print("=" * 60)

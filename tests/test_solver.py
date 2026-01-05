@@ -453,5 +453,365 @@ class TestNumericalStability:
             assert not torch.any(torch.isnan(samples))
 
 
+@pytest.mark.skipif(not TORCHDIFFEQ_AVAILABLE, reason="torchdiffeq not installed")
+class TestTemporalGuidedVelocityField:
+    """Test temporal guided velocity field for constrained forecasting."""
+
+    def test_temporal_guided_field_initialization(self):
+        """Test temporal guided field creation."""
+        from core.solver import TemporalGuidedVelocityField
+
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        regime = torch.zeros(1, dtype=torch.long)
+
+        field = TemporalGuidedVelocityField(
+            model=model,
+            regime=regime,
+            target_trajectories={0: 2.0, 1: -1.0},
+            guidance_strength=1.0
+        )
+
+        assert field.target_trajectories == {0: 2.0, 1: -1.0}
+        assert field.guidance_strength == 1.0
+
+    def test_temporal_guided_field_with_constant_targets(self):
+        """Test temporal guided field with constant target values."""
+        from core.solver import TemporalGuidedVelocityField
+
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        regime = torch.zeros(4, dtype=torch.long)
+
+        field = TemporalGuidedVelocityField(
+            model=model,
+            regime=regime,
+            target_trajectories={0: 2.0},
+            guidance_strength=1.0
+        )
+
+        t = torch.tensor(0.5)
+        x = torch.randn(4, 6)
+
+        v = field(t, x)
+
+        assert v.shape == (4, 6)
+        assert not torch.any(torch.isnan(v))
+
+    def test_temporal_guided_field_with_callable_targets(self):
+        """Test temporal guided field with callable target functions."""
+        from core.solver import TemporalGuidedVelocityField
+
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        regime = torch.zeros(4, dtype=torch.long)
+
+        # Define a time-varying target function
+        def linear_target(t):
+            return t * 3.0  # Target goes from 0 to 3 as t goes 0 to 1
+
+        field = TemporalGuidedVelocityField(
+            model=model,
+            regime=regime,
+            target_trajectories={0: linear_target},
+            guidance_strength=1.0
+        )
+
+        t = torch.tensor(0.5)
+        x = torch.randn(4, 6)
+
+        v = field(t, x)
+
+        assert v.shape == (4, 6)
+        assert not torch.any(torch.isnan(v))
+
+    def test_temporal_guided_field_multiple_variables(self):
+        """Test temporal guided field with multiple target variables."""
+        from core.solver import TemporalGuidedVelocityField
+
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        regime = torch.zeros(4, dtype=torch.long)
+
+        # Mix of constant and callable targets
+        targets = {
+            0: 2.0,
+            1: lambda t: -1.0 + t * 0.5,
+            3: 1.5
+        }
+
+        field = TemporalGuidedVelocityField(
+            model=model,
+            regime=regime,
+            target_trajectories=targets,
+            guidance_strength=1.0
+        )
+
+        t = torch.tensor(0.75)
+        x = torch.randn(4, 6)
+
+        v = field(t, x)
+
+        assert v.shape == (4, 6)
+        assert not torch.any(torch.isnan(v))
+
+
+@pytest.mark.skipif(not TORCHDIFFEQ_AVAILABLE, reason="torchdiffeq not installed")
+class TestForecastStep:
+    """Test single-step autoregressive forecasting."""
+
+    def test_forecast_step_basic(self):
+        """Test basic forecast step generation."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        solver = ODESolver(model, topology)
+
+        # Generate initial state
+        x_prev = torch.randn(10, 6)
+
+        x_next = solver.forecast_step(
+            x_prev=x_prev,
+            regime=0,
+            noise_scale=0.1
+        )
+
+        assert x_next.shape == (10, 6)
+        assert not torch.any(torch.isnan(x_next))
+
+    def test_forecast_step_with_constraints(self):
+        """Test forecast step with constraints."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        solver = ODESolver(model, topology)
+
+        x_prev = torch.randn(10, 6)
+        constraints = {0: 2.0, 1: -1.0}
+
+        x_next = solver.forecast_step(
+            x_prev=x_prev,
+            regime=0,
+            noise_scale=0.1,
+            constraints=constraints,
+            guidance_strength=1.0
+        )
+
+        assert x_next.shape == (10, 6)
+        assert not torch.any(torch.isnan(x_next))
+
+    def test_forecast_step_noise_scale_effect(self):
+        """Test that noise scale affects diversity."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        solver = ODESolver(model, topology)
+
+        torch.manual_seed(42)
+        x_prev = torch.randn(20, 6)
+
+        # Low noise
+        torch.manual_seed(123)
+        x_low_noise = solver.forecast_step(x_prev, regime=0, noise_scale=0.01)
+
+        # High noise
+        torch.manual_seed(123)
+        x_high_noise = solver.forecast_step(x_prev, regime=0, noise_scale=1.0)
+
+        # Both should be valid
+        assert not torch.any(torch.isnan(x_low_noise))
+        assert not torch.any(torch.isnan(x_high_noise))
+
+
+@pytest.mark.skipif(not TORCHDIFFEQ_AVAILABLE, reason="torchdiffeq not installed")
+class TestForecastPaths:
+    """Test multi-step autoregressive forecasting."""
+
+    def test_forecast_paths_basic(self):
+        """Test basic multi-step forecast path generation."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        solver = ODESolver(model, topology)
+
+        paths = solver.forecast_paths(
+            n_paths=10,
+            n_steps=5,
+            regime=0,
+            noise_scale=0.1
+        )
+
+        assert paths.shape == (10, 5, 6)
+        assert not torch.any(torch.isnan(paths))
+
+    def test_forecast_paths_with_initial_state(self):
+        """Test forecast paths with provided initial state."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        solver = ODESolver(model, topology)
+
+        initial_state = torch.randn(10, 6)
+
+        paths = solver.forecast_paths(
+            n_paths=10,
+            n_steps=5,
+            regime=0,
+            initial_state=initial_state
+        )
+
+        assert paths.shape == (10, 5, 6)
+        assert not torch.any(torch.isnan(paths))
+
+    def test_forecast_paths_with_constraints(self):
+        """Test forecast paths with constraint trajectories."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        solver = ODESolver(model, topology)
+
+        n_steps = 10
+        # Constraint trajectory for variable 0
+        constraint_trajectories = {
+            0: np.linspace(0, 2.0, n_steps)
+        }
+
+        paths = solver.forecast_paths(
+            n_paths=10,
+            n_steps=n_steps,
+            regime=0,
+            constraint_trajectories=constraint_trajectories,
+            guidance_strength=1.0
+        )
+
+        assert paths.shape == (10, n_steps, 6)
+        assert not torch.any(torch.isnan(paths))
+
+    def test_forecast_paths_temporal_coherence(self):
+        """Test that forecast paths have temporal coherence (autocorrelation)."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        solver = ODESolver(model, topology)
+
+        n_paths = 50
+        n_steps = 20
+
+        paths = solver.forecast_paths(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            regime=0,
+            noise_scale=0.1
+        )
+
+        # Compute lag-1 autocorrelation for each path
+        paths_np = paths.cpu().numpy()
+        autocorrs = []
+        for path_idx in range(n_paths):
+            for var_idx in range(6):
+                series = paths_np[path_idx, :, var_idx]
+                if len(series) > 1:
+                    corr = np.corrcoef(series[:-1], series[1:])[0, 1]
+                    if not np.isnan(corr):
+                        autocorrs.append(corr)
+
+        # Average autocorrelation should be positive (temporal coherence)
+        avg_autocorr = np.mean(autocorrs)
+        assert avg_autocorr > 0, f"Expected positive autocorrelation, got {avg_autocorr}"
+
+    def test_forecast_paths_regime_per_step(self):
+        """Test forecast paths with different regimes per step."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology(n_regimes=3)
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=3)
+        solver = ODESolver(model, topology)
+
+        n_steps = 6
+        regime_sequence = [0, 0, 1, 1, 2, 2]
+
+        paths = solver.forecast_paths(
+            n_paths=10,
+            n_steps=n_steps,
+            regime=regime_sequence,
+            noise_scale=0.1
+        )
+
+        assert paths.shape == (10, n_steps, 6)
+        assert not torch.any(torch.isnan(paths))
+
+
+@pytest.mark.skipif(not TORCHDIFFEQ_AVAILABLE, reason="torchdiffeq not installed")
+class TestSampleTemporalGuided:
+    """Test temporal guided sampling."""
+
+    def test_sample_temporal_guided_constant(self):
+        """Test temporal guided sampling with constant targets."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        solver = ODESolver(model, topology)
+
+        target_trajectories = {0: 2.0, 1: -1.0}
+
+        samples = solver.sample_temporal_guided(
+            n_samples=10,
+            target_trajectories=target_trajectories,
+            regime=0
+        )
+
+        assert samples.shape == (10, 6)
+        assert not torch.any(torch.isnan(samples))
+
+    def test_sample_temporal_guided_callable(self):
+        """Test temporal guided sampling with callable targets."""
+        from core.solver import ODESolver
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        solver = ODESolver(model, topology)
+
+        target_trajectories = {
+            0: lambda t: t * 2.0,  # Linear from 0 to 2
+            1: lambda t: np.sin(t * np.pi)  # Sine wave
+        }
+
+        samples = solver.sample_temporal_guided(
+            n_samples=10,
+            target_trajectories=target_trajectories,
+            regime=0
+        )
+
+        assert samples.shape == (10, 6)
+        assert not torch.any(torch.isnan(samples))
+
+    def test_sample_temporal_guided_with_trajectory(self):
+        """Test temporal guided sampling with trajectory return."""
+        from core.solver import ODESolver, SolverConfig
+
+        topology = create_mock_topology()
+        model = VelocityNetwork(state_dim=6, hidden_dim=32, n_regimes=2)
+        config = SolverConfig(n_steps=10)
+        solver = ODESolver(model, topology, config)
+
+        target_trajectories = {0: 2.0}
+
+        samples, trajectory = solver.sample_temporal_guided(
+            n_samples=5,
+            target_trajectories=target_trajectories,
+            regime=0,
+            return_trajectory=True
+        )
+
+        assert samples.shape == (5, 6)
+        assert trajectory.shape[0] == 11  # n_steps + 1
+        assert trajectory.shape[1] == 5
+        assert trajectory.shape[2] == 6
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
