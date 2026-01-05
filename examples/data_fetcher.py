@@ -116,7 +116,7 @@ def fetch_yahoo_data(
 
     print(f"  Retrieved {len(df)} daily observations")
 
-    return df
+    return df.with_columns(pl.col("date").cast(pl.Date))
 
 
 def fetch_fred_data(
@@ -186,14 +186,14 @@ def fetch_fred_data(
     # Join all series on date
     result = dfs[0]
     for df in dfs[1:]:
-        result = result.join(df, on='date', how='outer')
+        result = result.join(df, on='date', how='outer', coalesce=True)
 
     # Sort by date
     result = result.sort('date')
 
     print(f"  Retrieved {len(result)} observations total")
 
-    return result
+    return result.with_columns(pl.col("date").cast(pl.Date))
 
 
 def fetch_all_data(
@@ -202,7 +202,7 @@ def fetch_all_data(
     start_date: str = START_DATE,
     end_date: str = END_DATE,
     fred_api_key: Optional[str] = None
-) -> Tuple[pl.DataFrame, Dict[str, str], Dict[str, str]]:
+) -> pl.DataFrame:
     """Fetch combined market and economic data.
 
     Args:
@@ -233,7 +233,7 @@ def fetch_all_data(
         slow_vars = {}
     else:
         # Join on date (FRED is typically lower frequency, so we forward-fill)
-        combined = yahoo_df.join(fred_df, on='date', how='left')
+        combined = yahoo_df.join(fred_df, on='date', how='left', coalesce=True)
 
         # Forward fill FRED data (monthly/quarterly data)
         for col in fred_df.columns:
@@ -242,16 +242,12 @@ def fetch_all_data(
                     pl.col(col).forward_fill()
                 )
 
-        # Classify variables
-        fast_vars = YAHOO_TICKERS.copy()
-        slow_vars = FRED_SERIES.copy()
-
     # Drop rows with any NaN (after forward fill)
     combined = combined.drop_nulls()
 
     print(f"\nCombined dataset: {len(combined)} rows, {len(combined.columns)} columns")
 
-    return combined, fast_vars, slow_vars
+    return combined
 
 
 def compute_returns(df: pl.DataFrame, price_cols: List[str]) -> pl.DataFrame:
