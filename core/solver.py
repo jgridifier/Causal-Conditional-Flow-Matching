@@ -51,11 +51,21 @@ class SolverConfig:
     Attributes:
         method: Integration method ('dopri5', 'euler', 'rk4', 'midpoint')
         rtol: Relative tolerance for adaptive solvers (default 1e-5)
+            For poorly trained models or quick demos, relax to ~1e-3
         atol: Absolute tolerance for adaptive solvers (default 1e-6)
+            For poorly trained models or quick demos, relax to ~1e-4
         step_size: Fixed step size for non-adaptive methods (default 0.01)
         n_steps: Number of integration steps if using fixed stepping (default 100)
         use_adjoint: Whether to use adjoint method for memory efficiency
         max_num_steps: Maximum number of ODE solver steps (default 10000)
+
+    Note:
+        If you encounter "underflow in dt" errors, the adaptive solver cannot
+        meet the tolerance requirements. This often happens with incompletely
+        trained models. Solutions:
+        - Switch to fixed-step method 'rk4' (recommended for demos/poorly trained models)
+        - Train the model longer until convergence
+        - As a last resort, relax rtol/atol (e.g., rtol=1e-3, atol=1e-4)
     """
     method: str = 'dopri5'
     rtol: float = 1e-5

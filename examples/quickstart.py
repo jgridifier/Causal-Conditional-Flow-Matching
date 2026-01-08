@@ -17,6 +17,7 @@ import os
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import polars as pl
 import numpy as np
 import torch
 
@@ -40,7 +41,8 @@ def main():
 
     # Use synthetic data (works without API keys)
     # For real data, use: fetch_all_data() from data_fetcher.py
-    X  = fetch_all_data()
+    # X  = fetch_all_data()
+    X = pl.read_ipc("examples/all_data.arrow") # pre loaded for testing quicker
 
     print(f"  Data shape: {X.shape}")
 
@@ -76,7 +78,7 @@ def main():
     print("\n[4/5] Training flow matching model...")
 
     results = cfm.train(
-        n_epochs=100,        # Reduced for quick demo
+        n_epochs=1000,        # Reduced for quick demo
         lr=1e-3,
         batch_size=64,
         validate_every=20,
@@ -127,6 +129,14 @@ def main():
     # Step 6: Temporal Forecasting
     # =========================================================================
     print("\n[6/6] Temporal Forecasting...")
+
+    # NOTE: For quickstart demo, we use fixed-step RK4 method since we only
+    # trained for 100 epochs. The adaptive Dopri5 method requires well-trained
+    # models to avoid numerical issues. For production use with fully trained
+    # models, use method='dopri5' with tight tolerances for better accuracy.
+    cfm.solver.config.method = 'rk4'  # Fixed-step method (more robust)
+    cfm.solver.config.step_size = 0.05  # Step size for RK4
+    print("\n  Using RK4 solver for quick demo (more robust for incompletely trained models)")
 
     # Generate autoregressive temporal forecasts (3 years forward)
     print("\n  Generating temporal forecast paths (36 months forward)...")

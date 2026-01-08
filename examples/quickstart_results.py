@@ -43,6 +43,9 @@ X = fetch_all_data()  # polars dataframe with date column
 print("=" * 60)
 print("Temporal Forecasting with C-CFM")
 print("=" * 60)
+cfm.solver.config.method = 'rk4'  # Fixed-step method (more robust)
+cfm.solver.config.step_size = 0.05  # Step size for RK4
+print("\n  Using RK4 solver for quick demo (more robust for incompletely trained models)")
 
 n_paths = 50  # Number of different scenario paths
 n_steps = 48  # Number of time steps forward (48 months = 4 years)
