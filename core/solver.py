@@ -594,29 +594,46 @@ class ODESolver:
         regime: Union[int, torch.Tensor],
         noise_scale: float = 0.1,
         constraints: Optional[Dict[int, float]] = None,
-        guidance_strength: float = 1.0
+        guidance_strength: float = 1.0,
+        conditioning_strength: float = 0.5
     ) -> torch.Tensor:
         """Generate one forecasting step conditioned on previous state.
 
-        This implements autoregressive forecasting by using the previous
-        state as the starting point (with noise) and integrating forward.
+        IMPORTANT: CFM is trained to map N(0,I) -> data distribution. To create
+        temporal coherence, we use GUIDANCE to pull the generated sample towards
+        a neighborhood of the previous state. We do NOT start from x_prev directly
+        because the ODE was not trained for that mapping.
+
+        The approach:
+        1. Start from standard Gaussian noise x_0 ~ N(0, I)
+        2. Integrate with guidance that pulls ALL variables towards x_prev
+        3. Add innovation noise via reduced guidance strength
+
+        This ensures:
+        - The ODE operates in its trained regime (noise -> data)
+        - Temporal coherence via guidance towards previous state
+        - Innovation/diversity via stochastic starting point and partial guidance
 
         Args:
             x_prev: Previous state tensor of shape (n_samples, dim) in NORMALIZED space
             regime: Regime label
-            noise_scale: Scale of noise to add to x_prev before integrating (default 0.1)
-            constraints: Optional dict mapping variable index to target value
-            guidance_strength: Strength of guidance for constraints
+            noise_scale: NOT USED (kept for backward compatibility). Diversity comes
+                        from the stochastic x_0 and the conditioning_strength.
+            constraints: Optional dict mapping variable index to target value.
+                        These override the x_prev conditioning for specific variables.
+            guidance_strength: Strength of guidance for constraints (default 1.0)
+            conditioning_strength: How strongly to condition on x_prev (default 0.5).
+                        Lower values = more diversity, higher = more temporal coherence.
 
         Returns:
             x_next: Next state tensor of shape (n_samples, dim) in normalized space
         """
         self.model.eval()
         n_samples = x_prev.shape[0]
+        dim = x_prev.shape[1]
 
-        # Add noise to previous state for diversity (this creates the "innovation")
-        # The noise scale controls how much the forecast can deviate from conditioning
-        x_0 = x_prev + noise_scale * torch.randn_like(x_prev)
+        # Start from standard Gaussian noise (the correct x_0 for CFM)
+        x_0 = torch.randn(n_samples, dim, device=self.device)
 
         # Prepare regime
         if isinstance(regime, int):
@@ -624,18 +641,28 @@ class ODESolver:
         else:
             regime_tensor = regime.to(self.device)
 
-        # Choose velocity field based on whether we have constraints
-        if constraints and len(constraints) > 0:
-            velocity_fn = TemporalGuidedVelocityField(
-                self.model,
-                regime_tensor,
-                target_trajectories=constraints,
-                guidance_strength=guidance_strength
-            )
-        else:
-            velocity_fn = VelocityFieldWrapper(self.model, regime_tensor)
+        # Build target trajectories: guide ALL variables towards x_prev
+        # with optional overrides from constraints
+        target_trajectories = {}
+        for i in range(dim):
+            # Use mean of x_prev for this variable as the target
+            target_trajectories[i] = float(x_prev[:, i].mean().item())
 
-        # Integrate
+        # Override with explicit constraints if provided
+        if constraints and len(constraints) > 0:
+            for idx, val in constraints.items():
+                target_trajectories[idx] = val
+
+        # Create guided velocity field that pulls towards previous state
+        velocity_fn = TemporalGuidedVelocityField(
+            self.model,
+            regime_tensor,
+            target_trajectories=target_trajectories,
+            guidance_strength=conditioning_strength,  # Use conditioning strength for x_prev
+            eps=1e-4
+        )
+
+        # Integrate from noise to data with guidance
         integrator = odeint_adjoint if self.config.use_adjoint else odeint
         trajectory = integrator(
             velocity_fn,

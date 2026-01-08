@@ -483,7 +483,13 @@ class VelocityNetwork(nn.Module):
             self.causal_order = np.arange(state_dim)
 
         # Store causal mask for verification
-        mask = create_causal_mask(state_dim, self.causal_order)
+        # IMPORTANT: Data is ALREADY reordered according to causal_order before being
+        # passed to the network. So in the network's view:
+        #   - Position 0 = most upstream (FAST) variable
+        #   - Position state_dim-1 = most downstream (SLOW/sink) variable
+        # Therefore, the degree of variable at position i is simply i.
+        self.state_degrees = np.arange(state_dim)
+        mask = create_causal_mask(state_dim)  # Use default natural ordering
         self.register_buffer('causal_mask', mask)
 
         # Assign degrees to hidden units (MADE requirement)
@@ -507,9 +513,10 @@ class VelocityNetwork(nn.Module):
         )
 
         # Input projection mask: state variables -> hidden units
-        # State variable i has degree = causal_order[i]
+        # FIXED: Use self.state_degrees (= [0,1,2,...]) not self.causal_order
+        # State variable at position i has degree = i (data is already in causal order)
         # Hidden unit j can only see state variables with degree <= hidden_degrees[j]
-        input_mask = create_hidden_mask(self.causal_order, self.hidden_degrees)
+        input_mask = create_hidden_mask(self.state_degrees, self.hidden_degrees)
 
         # Input projection (masked)
         self.input_proj = MaskedLinear(
@@ -529,9 +536,10 @@ class VelocityNetwork(nn.Module):
         ])
 
         # Output projection mask: hidden units -> state variables
-        # Transpose of input logic: state variable i can only be influenced by
-        # hidden units with degree <= causal_order[i]
-        output_mask = create_hidden_mask(self.hidden_degrees, self.causal_order)
+        # FIXED: Use self.state_degrees (= [0,1,2,...]) not self.causal_order
+        # State variable at position i can only be influenced by hidden units
+        # with degree <= i (= state_degrees[i])
+        output_mask = create_hidden_mask(self.hidden_degrees, self.state_degrees)
 
         # Output projection (masked)
         self.output_proj = MaskedLinear(
